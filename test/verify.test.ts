@@ -116,3 +116,9 @@ test("a number is not found inside a longer space-grouped number", () => {
     "rejected",
   );
 });
+
+test("a blank issue date is dropped like any other unusable optional field", () => {
+  const v = verifyExtraction({ ...good, issue_date: "  " }, TEXT);
+  assert.equal(v.kind, "bill");
+  assert.equal(v.bill.issueDate, null);
+});

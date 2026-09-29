@@ -152,3 +152,21 @@ test("a transient failure stays queued until the attempt cap, then dead-letters"
   await processQueue({ db, clock, log: silentLog, extractor }, { dataDir, maxAttempts: 2 });
   assert.equal(listDeadLetteredInboundItems(db).length, 1);
 });
+
+test("a failure after the bill is written but before the item is marked leaves neither", async () => {
+  const db = memDb();
+  const clock = fixedClock("2026-09-20T10:00:00Z");
+  const dataDir = queueOne(db, clock);
+  const deps = { db, clock, log: silentLog, extractor: fakeExtractor([() => good, () => good]) };
+  // Stands in for a crash between the two writes: the second one fails.
+  db.exec(`CREATE TRIGGER crash BEFORE UPDATE OF status ON inbound_item
+           WHEN NEW.status = 'processed' BEGIN SELECT RAISE(ABORT, 'crash'); END`);
+
+  assert.deepEqual(await processQueue(deps, { dataDir, maxAttempts: 3 }), { done: 0, failed: 1 });
+  assert.equal(listActiveBills(db).length, 0);
+
+  db.exec("DROP TRIGGER crash");
+  await processQueue(deps, { dataDir, maxAttempts: 3 });
+  const row = db.prepare("SELECT status, result_code FROM inbound_item").get();
+  assert.deepEqual({ ...row }, { status: "processed", result_code: "bill_created" });
+});

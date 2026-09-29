@@ -10,6 +10,7 @@ import {
   listQueuedInboundItems,
   type InboundItem,
 } from "../bills/repo.ts";
+import { withTransaction } from "../db/db.ts";
 import { AppError, categoryOf, codeOf } from "../errors.ts";
 import { errorText } from "../log.ts";
 import type { Clock } from "../shared/time.ts";
@@ -115,14 +116,17 @@ function saveOutcome(
     case "rejected":
       throw new AppError("invalid", "EXTRACTION_UNVERIFIED", verdict.problems.join("; "));
     case "bill": {
-      const created = insertBill(db, clock, {
-        inboundItemId: item.id,
-        senderDomain: item.sender_domain,
-        ...verdict.bill,
-        extractionJson: JSON.stringify(extraction),
-        extractor: extractor.name,
+      // One transaction: a bill without its item marked would be re-read as a duplicate.
+      withTransaction(db, () => {
+        const created = insertBill(db, clock, {
+          inboundItemId: item.id,
+          senderDomain: item.sender_domain,
+          ...verdict.bill,
+          extractionJson: JSON.stringify(extraction),
+          extractor: extractor.name,
+        });
+        markInboundProcessed(db, clock, item.id, created ? "bill_created" : "duplicate_bill");
       });
-      markInboundProcessed(db, clock, item.id, created ? "bill_created" : "duplicate_bill");
       return;
     }
   }

@@ -134,7 +134,7 @@ export function verifyExtraction(x: Extraction, text: string): Verdict {
   if (!isCalendarDate(dueDate)) problems.push("due_date missing or not YYYY-MM-DD");
   else if (!isDateInText(dueDate, compactText)) problems.push("due_date not found in text");
 
-  let issueDate: string | null = x.issue_date?.trim() ?? null;
+  let issueDate: string | null = x.issue_date?.trim() || null;
   if (issueDate && (!isCalendarDate(issueDate) || !isDateInText(issueDate, compactText))) {
     // Optional field: drop it rather than reject the bill over it.
     issueDate = null;

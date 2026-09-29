@@ -20,7 +20,11 @@ export async function backup(
 
   const filesDir = path.join(opts.dataDir, "files");
   const have = new Set(await readdir(path.join(opts.backupDir, "files")));
-  const source = await readdir(filesDir).catch(() => [] as string[]);
+  // No files directory yet means nothing to copy; any other error fails the backup.
+  const source = await readdir(filesDir).catch((err: unknown) => {
+    if (err instanceof Error && "code" in err && err.code === "ENOENT") return [];
+    throw err;
+  });
   for (const name of source) {
     if (!have.has(name))
       await copyFile(path.join(filesDir, name), path.join(opts.backupDir, "files", name));
