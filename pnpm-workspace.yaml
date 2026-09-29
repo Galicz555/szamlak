@@ -1,0 +1,3 @@
+# Single package; this file exists for pnpm settings only.
+# A release must be a week old before it installs (supply-chain guard, guide A§10.5).
+minimumReleaseAge: 10080
