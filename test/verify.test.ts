@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { test } from "vitest";
 import type { Extraction } from "../src/extract/schema.ts";
 import { printedAmounts, verifyExtraction } from "../src/extract/verify.ts";
 

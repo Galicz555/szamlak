@@ -1,14 +1,13 @@
-import type { DatabaseSync } from "node:sqlite";
+import type { Kysely } from "kysely";
 import pino, { type Logger } from "pino";
-import { migrate, openDb } from "../src/db/db.ts";
+import { openDb } from "../src/db/db.ts";
+import type { Database } from "../src/db/schema.ts";
 import { createLogger } from "../src/log.ts";
 import type { Clock } from "../src/shared/time.ts";
 
 /** A fresh database built by the same migration chain production runs. */
-export function memDb(): DatabaseSync {
-  const db = openDb(":memory:");
-  migrate(db);
-  return db;
+export function memDb(): Kysely<Database> {
+  return openDb(":memory:").db;
 }
 
 export function fixedClock(iso: string): Clock & { set(iso: string): void } {

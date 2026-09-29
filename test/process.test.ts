@@ -2,13 +2,14 @@ import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import type { DatabaseSync } from "node:sqlite";
-import { test } from "node:test";
+import { sql, type Kysely } from "kysely";
+import { test } from "vitest";
 import {
   listDeadLetteredInboundItems,
   insertInboundItem,
   listActiveBills,
 } from "../src/bills/repo.ts";
+import type { Database } from "../src/db/schema.ts";
 import { AppError } from "../src/errors.ts";
 import type { BillExtractor } from "../src/extract/extractors.ts";
 import { processQueue } from "../src/extract/process.ts";
@@ -48,10 +49,13 @@ function fakeExtractor(
   };
 }
 
-function queueOne(db: DatabaseSync, clock: ReturnType<typeof fixedClock>): string {
+async function queueOne(
+  db: Kysely<Database>,
+  clock: ReturnType<typeof fixedClock>,
+): Promise<string> {
   const dir = mkdtempSync(path.join(tmpdir(), "szamlak-"));
   writeFileSync(path.join(dir, "body.txt"), TEXT);
-  insertInboundItem(db, clock, {
+  await insertInboundItem(db, clock, {
     contentSha256: "sha-1",
     kind: "body",
     mailbox: "INBOX",
@@ -69,16 +73,16 @@ function queueOne(db: DatabaseSync, clock: ReturnType<typeof fixedClock>): strin
 test("a verified extraction becomes a bill; the same invoice again is a duplicate", async () => {
   const db = memDb();
   const clock = fixedClock("2026-09-20T10:00:00Z");
-  const dataDir = queueOne(db, clock);
+  const dataDir = await queueOne(db, clock);
   const extractor = fakeExtractor([() => good, () => good]);
   const deps = { db, clock, log: silentLog, extractor };
   const r = await processQueue(deps, { dataDir, maxAttempts: 3 });
   assert.deepEqual(r, { done: 1, failed: 0 });
-  const [bill] = listActiveBills(db);
+  const [bill] = await listActiveBills(db);
   assert.equal(bill?.amount_minor, 899_000);
 
   // The same bill again, in another message (a reminder with a re-rendered PDF).
-  insertInboundItem(db, clock, {
+  await insertInboundItem(db, clock, {
     contentSha256: "sha-2",
     kind: "body",
     mailbox: "INBOX",
@@ -91,8 +95,12 @@ test("a verified extraction becomes a bill; the same invoice again is a duplicat
     filePath: "body.txt",
   });
   assert.deepEqual(await processQueue(deps, { dataDir, maxAttempts: 3 }), { done: 1, failed: 0 });
-  assert.equal(listActiveBills(db).length, 1);
-  const results = db.prepare("SELECT result_code FROM inbound_item ORDER BY uid").all();
+  assert.equal((await listActiveBills(db)).length, 1);
+  const results = await db
+    .selectFrom("inbound_item")
+    .select("result_code")
+    .orderBy("uid")
+    .execute();
   assert.deepEqual(
     results.map((row) => row.result_code),
     ["bill_created", "duplicate_bill"],
@@ -103,29 +111,29 @@ test("a verified extraction becomes a bill; the same invoice again is a duplicat
 test("a wrong answer gets exactly one corrective retry that names the failed check", async () => {
   const db = memDb();
   const clock = fixedClock("2026-09-20T10:00:00Z");
-  const dataDir = queueOne(db, clock);
+  const dataDir = await queueOne(db, clock);
   const extractor = fakeExtractor([() => ({ ...good, amount_due_text: "9 890" }), () => good]);
   await processQueue({ db, clock, log: silentLog, extractor }, { dataDir, maxAttempts: 3 });
   assert.deepEqual(extractor.calls, [undefined, "amount_due_text not found in text"]);
-  assert.equal(listActiveBills(db).length, 1);
+  assert.equal((await listActiveBills(db)).length, 1);
 });
 
 test("a model that stays wrong dead-letters the item instead of inventing a bill", async () => {
   const db = memDb();
   const clock = fixedClock("2026-09-20T10:00:00Z");
-  const dataDir = queueOne(db, clock);
+  const dataDir = await queueOne(db, clock);
   const wrong = { ...good, due_date: "2026-10-16" };
   const extractor = fakeExtractor([() => wrong, () => wrong]);
   await processQueue({ db, clock, log: silentLog, extractor }, { dataDir, maxAttempts: 3 });
-  assert.equal(listActiveBills(db).length, 0);
-  const [item] = listDeadLetteredInboundItems(db);
+  assert.equal((await listActiveBills(db)).length, 0);
+  const [item] = await listDeadLetteredInboundItems(db);
   assert.equal(item?.last_error_code, "EXTRACTION_UNVERIFIED");
 });
 
 test("the model server being down spends no attempts and fails the pass", async () => {
   const db = memDb();
   const clock = fixedClock("2026-09-20T10:00:00Z");
-  const dataDir = queueOne(db, clock);
+  const dataDir = await queueOne(db, clock);
   const extractor = fakeExtractor([
     () => {
       throw new AppError("transient", "EXTRACTOR_UNREACHABLE", "down");
@@ -135,38 +143,44 @@ test("the model server being down spends no attempts and fails the pass", async 
     processQueue({ db, clock, log: silentLog, extractor }, { dataDir, maxAttempts: 3 }),
     /down/,
   );
-  const row = db.prepare("SELECT status, attempt_count FROM inbound_item").get();
+  const row = await db
+    .selectFrom("inbound_item")
+    .select(["status", "attempt_count"])
+    .executeTakeFirst();
   assert.deepEqual({ ...row }, { status: "queued", attempt_count: 0 });
 });
 
 test("a transient failure stays queued until the attempt cap, then dead-letters", async () => {
   const db = memDb();
   const clock = fixedClock("2026-09-20T10:00:00Z");
-  const dataDir = queueOne(db, clock);
+  const dataDir = await queueOne(db, clock);
   const busy = () => {
     throw new AppError("transient", "EXTRACTOR_HTTP_503", "busy");
   };
   const extractor = fakeExtractor([busy, busy]);
   await processQueue({ db, clock, log: silentLog, extractor }, { dataDir, maxAttempts: 2 });
-  assert.equal(listDeadLetteredInboundItems(db).length, 0);
+  assert.equal((await listDeadLetteredInboundItems(db)).length, 0);
   await processQueue({ db, clock, log: silentLog, extractor }, { dataDir, maxAttempts: 2 });
-  assert.equal(listDeadLetteredInboundItems(db).length, 1);
+  assert.equal((await listDeadLetteredInboundItems(db)).length, 1);
 });
 
 test("a failure after the bill is written but before the item is marked leaves neither", async () => {
   const db = memDb();
   const clock = fixedClock("2026-09-20T10:00:00Z");
-  const dataDir = queueOne(db, clock);
+  const dataDir = await queueOne(db, clock);
   const deps = { db, clock, log: silentLog, extractor: fakeExtractor([() => good, () => good]) };
   // Stands in for a crash between the two writes: the second one fails.
-  db.exec(`CREATE TRIGGER crash BEFORE UPDATE OF status ON inbound_item
-           WHEN NEW.status = 'processed' BEGIN SELECT RAISE(ABORT, 'crash'); END`);
+  await sql`CREATE TRIGGER crash BEFORE UPDATE OF status ON inbound_item
+           WHEN NEW.status = 'processed' BEGIN SELECT RAISE(ABORT, 'crash'); END`.execute(db);
 
   assert.deepEqual(await processQueue(deps, { dataDir, maxAttempts: 3 }), { done: 0, failed: 1 });
-  assert.equal(listActiveBills(db).length, 0);
+  assert.equal((await listActiveBills(db)).length, 0);
 
-  db.exec("DROP TRIGGER crash");
+  await sql`DROP TRIGGER crash`.execute(db);
   await processQueue(deps, { dataDir, maxAttempts: 3 });
-  const row = db.prepare("SELECT status, result_code FROM inbound_item").get();
+  const row = await db
+    .selectFrom("inbound_item")
+    .select(["status", "result_code"])
+    .executeTakeFirst();
   assert.deepEqual({ ...row }, { status: "processed", result_code: "bill_created" });
 });

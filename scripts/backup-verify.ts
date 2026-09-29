@@ -4,9 +4,9 @@
  *
  *   pnpm backup:verify
  */
-import { DatabaseSync } from "node:sqlite";
-import { z } from "zod";
-import { parseRow } from "../src/db/rows.ts";
+import BetterSqlite3 from "better-sqlite3";
+import { Kysely, sql, SqliteDialect } from "kysely";
+import type { Database } from "../src/db/schema.ts";
 import { loadEnv } from "../src/env.ts";
 import { latestSnapshot } from "../src/poll/backup.ts";
 
@@ -16,24 +16,27 @@ if (!file) {
   console.error(`No snapshot in ${env.BACKUP_DIR}`);
   process.exit(1);
 }
-const db = new DatabaseSync(file, { readOnly: true });
-const integrity = parseRow(
-  z.object({ integrity_check: z.string() }),
-  db.prepare("PRAGMA integrity_check").get(),
-)?.integrity_check;
-const version = parseRow(
-  z.object({ user_version: z.number() }),
-  db.prepare("PRAGMA user_version").get(),
-)?.user_version;
-const count = (table: string) =>
-  parseRow(z.object({ n: z.number() }), db.prepare(`SELECT count(*) AS n FROM ${table}`).get())?.n;
+const db = new Kysely<Database>({
+  dialect: new SqliteDialect({ database: new BetterSqlite3(file, { readonly: true }) }),
+});
+const integrity = (await sql<{ integrity_check: string }>`PRAGMA integrity_check`.execute(db))
+  .rows[0]?.integrity_check;
+const version = (await sql<{ user_version: number }>`PRAGMA user_version`.execute(db)).rows[0]
+  ?.user_version;
+const count = async (table: "bill" | "bill_match" | "bank_transaction" | "inbound_item") =>
+  (
+    await db
+      .selectFrom(table)
+      .select((eb) => eb.fn.countAll<number>().as("n"))
+      .executeTakeFirstOrThrow()
+  ).n;
 console.log(`snapshot:        ${file}`);
 console.log(`integrity_check: ${String(integrity)}`);
 console.log(`schema version:  ${String(version)}`);
-for (const t of ["bill", "bill_match", "bank_transaction", "inbound_item"]) {
-  console.log(`${t.padEnd(16)} ${String(count(t))}`);
+for (const t of ["bill", "bill_match", "bank_transaction", "inbound_item"] as const) {
+  console.log(`${t.padEnd(16)} ${String(await count(t))}`);
 }
-db.close();
+await db.destroy();
 if (integrity !== "ok") process.exit(1);
 console.log(
   "\nRestore: stop the app, copy this file to $DATA_DIR/szamlak.db, copy files/ back, start.",

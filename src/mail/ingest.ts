@@ -1,19 +1,17 @@
 import { createHash } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
-import type { DatabaseSync } from "node:sqlite";
+import type { Kysely, Transaction } from "kysely";
 import { simpleParser, type Attachment, type ParsedMail } from "mailparser";
 import type { Logger } from "pino";
-import { z } from "zod";
 import { insertInboundItem, type NewInboundItem } from "../bills/repo.ts";
-import { withTransaction } from "../db/db.ts";
-import { parseRow } from "../db/rows.ts";
+import type { Database } from "../db/schema.ts";
 import { addDays, todayIn, type Clock } from "../shared/time.ts";
 import type { FetchResult, MailCursor, Mailbox } from "./mailbox.ts";
 import { isAddressedToUs, isSenderAuthenticated } from "./sender-auth.ts";
 
 export interface IngestDeps {
-  db: DatabaseSync;
+  db: Kysely<Database>;
   clock: Clock;
   log: Logger;
   mailbox: Mailbox;
@@ -76,7 +74,7 @@ async function fetchNewMail(
   { db, clock, mailbox }: IngestDeps,
   settings: MailSettings,
 ): Promise<FetchedMail> {
-  const cursor = getMailCursor(db);
+  const cursor = await getMailCursor(db);
   const since = new Date(
     `${addDays(todayIn(clock, settings.timeZone), -settings.lookbackDays)}T00:00:00Z`,
   );
@@ -86,11 +84,12 @@ async function fetchNewMail(
   return { ...fetched, previousUid };
 }
 
-function getMailCursor(db: DatabaseSync): MailCursor | null {
-  const row = parseRow(
-    z.object({ uid_validity: z.string(), last_uid: z.number() }),
-    db.prepare("SELECT uid_validity, last_uid FROM mail_cursor LIMIT 1").get(),
-  );
+async function getMailCursor(db: Kysely<Database>): Promise<MailCursor | null> {
+  const row = await db
+    .selectFrom("mail_cursor")
+    .select(["uid_validity", "last_uid"])
+    .limit(1)
+    .executeTakeFirst();
   return row ? { uidValidity: row.uid_validity, lastUid: row.last_uid } : null;
 }
 
@@ -201,23 +200,35 @@ async function saveContentOnce(
 
 const saveInboundBatchTo =
   ({ db, clock }: IngestDeps) =>
-  (batch: InboundBatch): IngestResult => {
-    const queued = withTransaction(db, () => {
-      let n = 0;
-      for (const item of batch.items) if (insertInboundItem(db, clock, item)) n++;
-      if (batch.lastUid > 0) saveMailCursor(db, batch);
-      return n;
-    });
-    return { queued, skipped: batch.skipped };
-  };
+  async (batch: InboundBatch): Promise<IngestResult> => ({
+    queued: await db.transaction().execute((trx) => saveInboundBatchIn(trx, clock, batch)),
+    skipped: batch.skipped,
+  });
 
-function saveMailCursor(
-  db: DatabaseSync,
+/** The queue rows and the cursor move together, or not at all. Returns how many were new. */
+async function saveInboundBatchIn(
+  trx: Transaction<Database>,
+  clock: Clock,
+  batch: InboundBatch,
+): Promise<number> {
+  let queued = 0;
+  for (const item of batch.items) if (await insertInboundItem(trx, clock, item)) queued++;
+  if (batch.lastUid > 0) await saveMailCursor(trx, batch);
+  return queued;
+}
+
+async function saveMailCursor(
+  trx: Transaction<Database>,
   { mailbox, uidValidity, lastUid }: { mailbox: string; uidValidity: string; lastUid: number },
-): void {
-  db.prepare(
-    `INSERT INTO mail_cursor (mailbox, uid_validity, last_uid) VALUES (?, ?, ?)
-     ON CONFLICT (mailbox) DO UPDATE SET uid_validity = excluded.uid_validity,
-       last_uid = excluded.last_uid`,
-  ).run(mailbox, uidValidity, lastUid);
+): Promise<void> {
+  await trx
+    .insertInto("mail_cursor")
+    .values({ mailbox, uid_validity: uidValidity, last_uid: lastUid })
+    .onConflict((oc) =>
+      oc.column("mailbox").doUpdateSet((eb) => ({
+        uid_validity: eb.ref("excluded.uid_validity"),
+        last_uid: eb.ref("excluded.last_uid"),
+      })),
+    )
+    .execute();
 }

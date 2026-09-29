@@ -25,9 +25,4 @@ export default defineConfig(
     files: ["scripts/**"],
     rules: { "no-console": "off" },
   },
-  {
-    // node:test's test() returns a promise the runner itself awaits and reports.
-    files: ["test/**"],
-    rules: { "@typescript-eslint/no-floating-promises": "off" },
-  },
 );

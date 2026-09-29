@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { test } from "node:test";
+import { sql } from "kysely";
+import { test } from "vitest";
 import { listQueuedInboundItems } from "../src/bills/repo.ts";
 import { ingestMail, isAllowedSender, type MailSettings } from "../src/mail/ingest.ts";
 import type { FetchResult, Mailbox } from "../src/mail/mailbox.ts";
@@ -90,7 +91,7 @@ test("an authenticated PDF bill is queued once, and the cursor moves past it", a
   assert.deepEqual(await ingestMail(deps, settings), { queued: 0, skipped: 0 });
   assert.deepEqual(mailbox.cursors, [null, { uidValidity: "9", lastUid: 41 }]);
 
-  const [item] = listQueuedInboundItems(db);
+  const [item] = await listQueuedInboundItems(db);
   assert.ok(item);
   assert.equal(item.kind, "pdf");
   assert.equal(item.subject, "Számla");
@@ -117,7 +118,7 @@ test("a forged sender is skipped and never queued", async () => {
     mailSettings(),
   );
   assert.deepEqual(r, { queued: 0, skipped: 1 });
-  assert.equal(listQueuedInboundItems(db).length, 0);
+  assert.equal((await listQueuedInboundItems(db)).length, 0);
 });
 
 test("a mail without a PDF queues its body text", async () => {
@@ -139,7 +140,7 @@ test("a mail without a PDF queues its body text", async () => {
     },
     mailSettings({ senders: ["telekom.hu"] }),
   );
-  assert.equal(listQueuedInboundItems(db)[0]?.kind, "body");
+  assert.equal((await listQueuedInboundItems(db))[0]?.kind, "body");
 });
 
 test("a genuine bill addressed to someone else (re-sent by another customer) is ignored", async () => {
@@ -212,7 +213,30 @@ test("an attachment named .pdf without the PDF signature is not queued as a PDF"
     mailSettings(),
   );
   assert.deepEqual(
-    listQueuedInboundItems(db).map((i) => i.kind),
+    (await listQueuedInboundItems(db)).map((i) => i.kind),
     ["body"],
   );
+});
+
+test("queue items and the mail cursor are saved together or not at all", async () => {
+  const db = memDb();
+  const clock = fixedClock("2026-09-20T10:00:00Z");
+  const msg = message({ from: "szamla@mvm.hu", auth: GOOD_AUTH, pdf: PDF });
+  const mailbox = fakeMailbox([
+    { mailbox: "INBOX", uidValidity: "1", messages: [{ uid: 11, source: msg }] },
+    { mailbox: "INBOX", uidValidity: "1", messages: [{ uid: 11, source: msg }] },
+  ]);
+  const deps = { db, clock, log: silentLog, mailbox };
+  const settings = mailSettings();
+  // Stands in for a crash between the two writes: the cursor write fails.
+  await sql`CREATE TRIGGER crash BEFORE INSERT ON mail_cursor
+            BEGIN SELECT RAISE(ABORT, 'crash'); END`.execute(db);
+
+  await assert.rejects(ingestMail(deps, settings), /crash/);
+  assert.equal((await listQueuedInboundItems(db)).length, 0);
+
+  // With the cursor unmoved, the next pass reads the same message and queues it.
+  await sql`DROP TRIGGER crash`.execute(db);
+  assert.deepEqual(await ingestMail(deps, settings), { queued: 1, skipped: 0 });
+  assert.deepEqual(mailbox.cursors, [null, null]);
 });

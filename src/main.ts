@@ -1,7 +1,7 @@
 import { mkdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { EnableBankingClient, loadPrivateKey } from "./bank/enable-banking.ts";
-import { migrate, openDb } from "./db/db.ts";
+import { openDb } from "./db/db.ts";
 import { loadEnv, type Env } from "./env.ts";
 import { GeminiExtractor, LocalExtractor, type BillExtractor } from "./extract/extractors.ts";
 import { createLogger, errorText } from "./log.ts";
@@ -19,8 +19,7 @@ function main(): void {
 
   // Fail fast: every dependency that can be checked without the network is checked before serving.
   mkdirSync(path.join(env.DATA_DIR, "files"), { recursive: true });
-  const db = openDb(path.join(env.DATA_DIR, "szamlak.db"));
-  const version = migrate(db);
+  const { db, schemaVersion } = openDb(path.join(env.DATA_DIR, "szamlak.db"));
   const key = loadPrivateKey(readFileSync(env.EB_PRIVATE_KEY_PATH, "utf8"));
   new Intl.DateTimeFormat("en-CA", { timeZone: env.TIME_ZONE }); // throws on an unknown zone
 
@@ -83,7 +82,7 @@ function main(): void {
   const timer = setInterval(() => void poller.trigger(), env.MAIL_POLL_MINUTES * 60_000);
 
   server.listen(env.PORT, env.HOST, () => {
-    log.info({ port: env.PORT, schemaVersion: version, extractor: extractor.name }, "listening");
+    log.info({ port: env.PORT, schemaVersion, extractor: extractor.name }, "listening");
     void poller.trigger();
   });
 
@@ -100,8 +99,8 @@ function main(): void {
     server.close();
     poller
       .idle()
+      .then(() => db.destroy())
       .then(() => {
-        db.close();
         clearTimeout(deadline);
         process.exit(0);
       })

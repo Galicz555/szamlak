@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { parseEnv } from "node:util";
-import { test } from "node:test";
+import { test } from "vitest";
 import { loadEnv, loadExtractorEnv } from "../src/env.ts";
 
 test("the extractor settings load alone, without the mail or bank settings the app needs", () => {

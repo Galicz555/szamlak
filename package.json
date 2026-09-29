@@ -10,7 +10,7 @@
   "scripts": {
     "start": "node --env-file=.env src/main.ts",
     "dev": "node --env-file=.env --watch src/main.ts",
-    "test": "node --test --test-randomize 'test/**/*.test.ts'",
+    "test": "vitest run",
     "types": "tsc --noEmit",
     "lint": "eslint .",
     "format": "prettier --write .",
@@ -21,18 +21,24 @@
     "prepare": "git config core.hooksPath .githooks"
   },
   "dependencies": {
+    "@hono/node-server": "2.1.1",
+    "better-sqlite3": "13.0.3",
+    "hono": "4.13.8",
     "imapflow": "2.0.5",
+    "kysely": "0.29.6",
     "mailparser": "3.9.28",
     "pino": "10.3.1",
     "zod": "4.6.5"
   },
   "devDependencies": {
     "@eslint/js": "9.39.5",
+    "@types/better-sqlite3": "9.6.0",
     "@types/mailparser": "3.4.6",
     "@types/node": "24.13.5",
     "eslint": "10.10.0",
     "prettier": "3.9.8",
     "typescript": "6.0.3",
-    "typescript-eslint": "8.70.0"
+    "typescript-eslint": "8.70.0",
+    "vitest": "5.0.1"
   }
 }

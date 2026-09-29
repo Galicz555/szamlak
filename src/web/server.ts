@@ -1,8 +1,10 @@
 import { randomBytes } from "node:crypto";
-import { createReadStream } from "node:fs";
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { open, type FileHandle } from "node:fs/promises";
 import path from "node:path";
-import type { DatabaseSync } from "node:sqlite";
+import { Readable } from "node:stream";
+import { createAdaptorServer, type ServerType } from "@hono/node-server";
+import { Hono, type MiddlewareHandler } from "hono";
+import type { Kysely } from "kysely";
 import type { Logger } from "pino";
 import { z } from "zod";
 import type { BankFeed } from "../bank/enable-banking.ts";
@@ -22,7 +24,7 @@ import {
   requeueInboundItem,
   type InboundItem,
 } from "../bills/repo.ts";
-import { withTransaction } from "../db/db.ts";
+import type { Database } from "../db/schema.ts";
 import { AppError, categoryOf, codeOf } from "../errors.ts";
 import { errorText } from "../log.ts";
 import { confirmMatch, listCandidates, revokeMatch } from "../match/matching.ts";
@@ -42,7 +44,7 @@ import {
 } from "./pages.ts";
 
 export interface WebDeps {
-  db: DatabaseSync;
+  db: Kysely<Database>;
   clock: Clock;
   log: Logger;
   poller: Poller;
@@ -59,8 +61,6 @@ const CONSENT_WARN_DAYS = 14;
 const OAUTH_STATE_BYTES = 24;
 const OAUTH_STATE_TTL_MS = 30 * 60_000;
 const ASPSP_COUNTRY = "HU";
-// req.url is only a path; URL needs some origin to resolve it against.
-const URL_BASE = "http://x";
 
 const uuid = z.uuid();
 const filterSchema = z.enum(["all", "awaiting", "overdue", "paid"]).catch("all");
@@ -71,18 +71,333 @@ const connectForm = z
   .transform(({ aspsp }) => ({ country: aspsp.slice(0, 2), name: aspsp.slice(3) }));
 const pasteForm = z.object({ url: z.url() }).strict();
 
-async function readForm(req: IncomingMessage): Promise<Record<string, string>> {
-  const type = req.headers["content-type"] ?? "";
+const STATUS_FOR: Record<ReturnType<typeof categoryOf>, number> = {
+  invalid: 400,
+  not_found: 404,
+  conflict: 409,
+  reauth: 502,
+  transient: 503,
+};
+
+/** The app on a Node HTTP server, not yet listening. */
+export function createWebServer(d: WebDeps): ServerType {
+  return createAdaptorServer({ fetch: createApp(d).fetch });
+}
+
+/**
+ * Every request passes the guard before anything else runs. The security headers wrap
+ * everything, so no HTML answer (page, error, 404, refused HEAD) can leave without them.
+ */
+export function createApp(d: WebDeps): Hono {
+  const app = new Hono();
+  app.use(secureHtmlResponses, refuseForeignRequests(d), refuseHead);
+
+  app.get("/", async (c) => {
+    const filter = filterSchema.parse(queryParam(c.req.url, "filter") ?? "all");
+    const today = todayIn(d.clock, d.timeZone);
+    const bills = await listActiveBills(d.db);
+    return htmlResponse(
+      200,
+      layout("Számlák", await getStatusBar(d), billsPage(bills, today, filter)),
+    );
+  });
+
+  app.get("/bills/:id", async (c) => {
+    const bill = await getBill(d.db, parseInput(uuid, c.req.param("id")));
+    if (!bill) throw new AppError("not_found", "BILL_NOT_FOUND", "No such bill");
+    const matchedTx = bill.match_transaction_id
+      ? await getTransaction(d.db, bill.match_transaction_id)
+      : undefined;
+    const candidates = matchedTx ? [] : await listCandidatesWithTransactions(d, bill.id);
+    const today = todayIn(d.clock, d.timeZone);
+    return htmlResponse(
+      200,
+      layout(
+        `${bill.supplier_name} · ${bill.invoice_number}`,
+        await getStatusBar(d),
+        billPage(bill, today, matchedTx, candidates),
+      ),
+    );
+  });
+
+  app.get("/bills/:id/file", async (c) => {
+    const bill = await getBill(d.db, parseInput(uuid, c.req.param("id")));
+    const item = bill ? await getInboundItem(d.db, bill.inbound_item_id) : undefined;
+    if (!item) throw new AppError("not_found", "FILE_NOT_FOUND", "No such file");
+    return fileResponse(d, item);
+  });
+
+  app.post("/bills/:id/match", async (c) => {
+    const billId = parseInput(uuid, c.req.param("id"));
+    const form = parseInput(matchForm, await readForm(c.req.raw));
+    await confirmMatch(d.db, d.clock, billId, form.transactionId);
+    return redirectResponse(`/bills/${billId}`);
+  });
+
+  app.post("/bills/:id/unmatch", async (c) => {
+    const billId = parseInput(uuid, c.req.param("id"));
+    await revokeMatch(d.db, d.clock, billId);
+    return redirectResponse(`/bills/${billId}`);
+  });
+
+  app.post("/bills/:id/dismiss", async (c) => {
+    await dismissBill(d.db, parseInput(uuid, c.req.param("id")));
+    return redirectResponse("/");
+  });
+
+  app.get("/inbox", async () => {
+    const items = await listDeadLetteredInboundItems(d.db);
+    return htmlResponse(
+      200,
+      layout("Kézi beavatkozás kell", await getStatusBar(d), inboxPage(items, d.timeZone)),
+    );
+  });
+
+  app.get("/inbox/:id/file", async (c) => {
+    const item = await getInboundItem(d.db, parseInput(uuid, c.req.param("id")));
+    if (!item) throw new AppError("not_found", "FILE_NOT_FOUND", "No such file");
+    return fileResponse(d, item);
+  });
+
+  app.post("/inbox/:id/retry", async (c) => {
+    await requeueInboundItem(d.db, d.clock, parseInput(uuid, c.req.param("id")));
+    void d.poller.trigger();
+    return redirectResponse("/inbox");
+  });
+
+  app.post("/sync", () => {
+    void d.poller.trigger({ forceBank: false });
+    return redirectResponse("/");
+  });
+
+  app.get("/bank", async (c) => {
+    const message = queryParam(c.req.url, "ok") === "1" ? "A bankkapcsolat elmentve." : null;
+    let aspsps: { name: string; country: string }[] | { error: string };
+    try {
+      aspsps = await d.feed.listAspsps(ASPSP_COUNTRY);
+    } catch (err: unknown) {
+      aspsps = { error: errorText(err, { maxChars: 200 }) };
+    }
+    const accounts = await listAccounts(d.db);
+    return htmlResponse(
+      200,
+      layout(
+        "Bankkapcsolat",
+        await getStatusBar(d),
+        bankPage(accounts, aspsps, message, d.timeZone),
+      ),
+    );
+  });
+
+  app.post("/bank/connect", async (c) => {
+    const wanted = parseInput(connectForm, await readForm(c.req.raw));
+    const aspsp = (await d.feed.listAspsps(wanted.country)).find((a) => a.name === wanted.name);
+    if (!aspsp) throw new AppError("invalid", "ASPSP_UNKNOWN", "Unknown bank");
+    const seconds = Math.min(aspsp.maxConsentSeconds, MAX_CONSENT_SECONDS);
+    const validUntil = new Date(d.clock.now().getTime() + seconds * 1000).toISOString();
+    const state = randomBytes(OAUTH_STATE_BYTES).toString("base64url");
+    await saveOauthState(
+      d.db,
+      state,
+      aspsp,
+      new Date(d.clock.now().getTime() + OAUTH_STATE_TTL_MS).toISOString(),
+    );
+    const { url } = await d.feed.startAuthorisation({
+      aspsp: { name: aspsp.name, country: aspsp.country },
+      state,
+      validUntil,
+      redirectUrl: d.redirectUrl,
+    });
+    if (!isBankLoginUrl(url)) {
+      throw new AppError(
+        "invalid",
+        "AUTH_URL_UNEXPECTED",
+        `Unexpected bank login address: ${new URL(url).hostname}`,
+      );
+    }
+    return redirectResponse(url);
+  });
+
+  app.get("/bank/callback", async (c) => {
+    const code = queryParam(c.req.url, "code");
+    const state = queryParam(c.req.url, "state");
+    if (!code || !state) {
+      // Any site can send the browser here; its text is logged, never shown as ours.
+      d.log.warn(
+        { error: queryParam(c.req.url, "error")?.slice(0, 200) },
+        "bank callback without code",
+      );
+      throw new AppError("invalid", "BANK_AUTH_DECLINED", "A bank nem adott hozzáférést.");
+    }
+    await completeBankSession(d, code, state);
+    void d.poller.trigger({ forceBank: true });
+    return redirectResponse("/bank?ok=1");
+  });
+
+  app.post("/bank/callback-paste", async (c) => {
+    const pasted = new URL(parseInput(pasteForm, await readForm(c.req.raw)).url);
+    const code = pasted.searchParams.get("code");
+    const state = pasted.searchParams.get("state");
+    if (!code || !state) {
+      throw new AppError("invalid", "BANK_AUTH_DECLINED", "The address has no code");
+    }
+    await completeBankSession(d, code, state);
+    void d.poller.trigger({ forceBank: true });
+    return redirectResponse("/bank?ok=1");
+  });
+
+  app.get(
+    "/style.css",
+    () =>
+      new Response(STYLE, {
+        headers: { "content-type": "text/css; charset=utf-8", "cache-control": "max-age=300" },
+      }),
+  );
+
+  app.notFound(async () =>
+    htmlResponse(
+      404,
+      layout("Nincs ilyen oldal", await getStatusBar(d), htmlError("Nincs ilyen oldal.")),
+    ),
+  );
+
+  app.onError(async (err, c) => {
+    d.log.warn(
+      { method: c.req.method, pathname: c.req.path, code: codeOf(err), err: errorText(err) },
+      "request failed",
+    );
+    const message = err instanceof AppError ? `${err.code}: ${err.message}` : "Váratlan hiba";
+    return htmlResponse(
+      STATUS_FOR[categoryOf(err)],
+      layout("Hiba", await getStatusBar(d), htmlError(message)),
+    );
+  });
+
+  return app;
+}
+
+// ---- middleware ----------------------------------------------------------------------------
+
+/** The Host/Origin guard (web/guard.ts), before anything else runs. */
+const refuseForeignRequests =
+  (d: WebDeps): MiddlewareHandler =>
+  async (c, next) => {
+    const guard = guardRequest(c.req.method, Object.fromEntries(c.req.raw.headers), d.port);
+    if (!guard.ok) {
+      const { pathname, search } = new URL(c.req.url);
+      d.log.warn(
+        { method: c.req.method, url: pathname + search, reason: guard.reason },
+        "request refused",
+      );
+      return new Response(guard.reason, {
+        status: guard.status,
+        headers: { "content-type": "text/plain" },
+      });
+    }
+    await next();
+  };
+
+/**
+ * The app answers no HEAD request. Hono would run the GET handler for one (and `/bank` would
+ * call the bank for it); a 404 keeps HEAD doing nothing.
+ */
+const refuseHead: MiddlewareHandler = async (c, next) => {
+  if (c.req.method === "HEAD") return c.notFound();
+  await next();
+};
+
+/** Pages, the error page and the 404 page: every HTML answer, and only those. */
+const secureHtmlResponses: MiddlewareHandler = async (c, next) => {
+  await next();
+  if (!c.res.headers.get("content-type")?.startsWith("text/html")) return;
+  for (const [name, value] of Object.entries(HTML_SECURITY_HEADERS)) c.res.headers.set(name, value);
+};
+
+// ---- responses -----------------------------------------------------------------------------
+
+function htmlResponse(status: number, page: Html): Response {
+  return new Response(page.value, {
+    status,
+    headers: { "content-type": "text/html; charset=utf-8" },
+  });
+}
+
+function redirectResponse(location: string): Response {
+  return new Response(null, { status: 303, headers: { location, "cache-control": "no-store" } });
+}
+
+/**
+ * Streams a stored item file. A file that is gone is a 404; any other read error is logged and
+ * answered with a 500, or, once the 200 is out, ends the response abruptly so a partial file
+ * never looks complete.
+ */
+async function fileResponse(d: WebDeps, item: InboundItem): Promise<Response> {
+  const file = path.join(d.dataDir, item.file_path);
+  let handle: FileHandle;
+  try {
+    handle = await open(file);
+  } catch (err: unknown) {
+    if (err instanceof Error && "code" in err && err.code === "ENOENT") {
+      return new Response("Not found", { status: 404, headers: { "content-type": "text/plain" } });
+    }
+    logFileReadFailure(d.log, item, err);
+    return new Response("Could not read file", {
+      status: 500,
+      headers: { "content-type": "text/plain" },
+    });
+  }
+  const stream = handle.createReadStream();
+  stream.on("error", (err) => {
+    logFileReadFailure(d.log, item, err);
+  });
+  const isPdf = file.endsWith(".pdf");
+  return new Response(Readable.toWeb(stream), {
+    headers: {
+      // Hostile documents never render on our origin: PDFs download (a PDF-viewer bug would
+      // otherwise run with this app's Origin), text is sandboxed.
+      "content-type": isPdf ? "application/pdf" : "text/plain; charset=utf-8",
+      "content-disposition": isPdf ? "attachment" : "inline",
+      "content-security-policy": "default-src 'none'; sandbox",
+      "x-content-type-options": "nosniff",
+      "cache-control": "no-store",
+    },
+  });
+}
+
+function logFileReadFailure(log: Logger, item: InboundItem, err: unknown): void {
+  const code = err instanceof Error && "code" in err ? err.code : undefined;
+  log.error(
+    { itemId: item.id, filePath: item.file_path, code, err: errorText(err) },
+    "file read failed",
+  );
+}
+
+function htmlError(message: string): Html {
+  return html`<p class="bad">${message}</p>
+    <p><a href="/">Vissza a számlákhoz</a></p>`;
+}
+
+// ---- request input -------------------------------------------------------------------------
+
+/** The first value of a query parameter, decoded the URLSearchParams way. */
+function queryParam(url: string, name: string): string | null {
+  return new URL(url).searchParams.get(name);
+}
+
+async function readForm(req: Request): Promise<Record<string, string>> {
+  const type = req.headers.get("content-type") ?? "";
   if (!type.startsWith("application/x-www-form-urlencoded")) {
     throw new AppError("invalid", "FORM_CONTENT_TYPE", "Expected a form post");
   }
-  const chunks: Buffer[] = [];
+  const chunks: Uint8Array[] = [];
   let size = 0;
-  for await (const chunk of req) {
-    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
-    size += buf.length;
-    if (size > MAX_FORM_BYTES) throw new AppError("invalid", "FORM_TOO_LARGE", "Form too large");
-    chunks.push(buf);
+  if (req.body) {
+    for await (const chunk of req.body) {
+      if (!(chunk instanceof Uint8Array)) throw new Error("Request body chunk is not bytes");
+      size += chunk.byteLength;
+      if (size > MAX_FORM_BYTES) throw new AppError("invalid", "FORM_TOO_LARGE", "Form too large");
+      chunks.push(chunk);
+    }
   }
   return Object.fromEntries(new URLSearchParams(Buffer.concat(chunks).toString("utf8")));
 }
@@ -93,61 +408,13 @@ function parseInput<S extends z.ZodType>(schema: S, value: unknown): z.infer<S> 
   return r.data;
 }
 
-function sendHtml(res: ServerResponse, status: number, page: Html): void {
-  res.writeHead(status, { "content-type": "text/html; charset=utf-8", ...HTML_SECURITY_HEADERS });
-  res.end(page.value);
-}
+// ---- page data -----------------------------------------------------------------------------
 
-function redirect(res: ServerResponse, location: string): void {
-  res.writeHead(303, { location, "cache-control": "no-store" });
-  res.end();
-}
-
-/**
- * Streams a stored item file. A file that is gone is a 404; any other read error is logged and
- * answered with a 500, or, once the 200 is out, ends the response abruptly so a partial file
- * never looks complete.
- */
-function sendFile(d: WebDeps, res: ServerResponse, item: InboundItem): void {
-  const file = path.join(d.dataDir, item.file_path);
-  const isPdf = file.endsWith(".pdf");
-  const stream = createReadStream(file);
-  stream.on("error", (err) => {
-    const code = "code" in err ? err.code : undefined;
-    if (!res.headersSent && code === "ENOENT") {
-      res.writeHead(404, { "content-type": "text/plain" });
-      res.end("Not found");
-      return;
-    }
-    d.log.error(
-      { itemId: item.id, filePath: item.file_path, code, err: errorText(err) },
-      "file read failed",
-    );
-    if (res.headersSent) {
-      res.destroy(err);
-      return;
-    }
-    res.writeHead(500, { "content-type": "text/plain" });
-    res.end("Could not read file");
-  });
-  stream.once("open", () => {
-    // Hostile documents never render on our origin: PDFs download (a PDF-viewer bug would
-    // otherwise run with this app's Origin), text is sandboxed.
-    res.writeHead(200, {
-      "content-type": isPdf ? "application/pdf" : "text/plain; charset=utf-8",
-      "content-disposition": isPdf ? "attachment" : "inline",
-      "content-security-policy": "default-src 'none'; sandbox",
-      "x-content-type-options": "nosniff",
-      "cache-control": "no-store",
-    });
-    stream.pipe(res);
-  });
-}
-
-function getStatusBar(d: WebDeps): StatusBar {
+async function getStatusBar(d: WebDeps): Promise<StatusBar> {
   const now = d.clock.now().getTime();
+  const accounts = await listAccounts(d.db);
   const consentWarnings = [
-    ...new Map(listAccounts(d.db).map((a) => [a.aspsp_name, a.valid_until])).entries(),
+    ...new Map(accounts.map((a) => [a.aspsp_name, a.valid_until])).entries(),
   ].flatMap(([bank, until]) => {
     const days = Math.floor((Date.parse(until) - now) / 86_400_000);
     if (days < 0) return [`${bank}: a banki hozzájárulás lejárt, kösd össze újra`];
@@ -157,319 +424,49 @@ function getStatusBar(d: WebDeps): StatusBar {
   return {
     running: d.poller.running,
     runs: [
-      { label: "Levelek", run: getLastRun(d.db, "mail") },
-      { label: "Kiolvasás", run: getLastRun(d.db, "extract") },
-      { label: "Bank", run: getLastRun(d.db, "bank") },
-      { label: "Mentés", run: getLastRun(d.db, "backup") },
+      { label: "Levelek", run: await getLastRun(d.db, "mail") },
+      { label: "Kiolvasás", run: await getLastRun(d.db, "extract") },
+      { label: "Bank", run: await getLastRun(d.db, "bank") },
+      { label: "Mentés", run: await getLastRun(d.db, "backup") },
     ],
-    deadLettered: listDeadLetteredInboundItems(d.db).length,
+    deadLettered: (await listDeadLetteredInboundItems(d.db)).length,
     consentWarnings,
     timeZone: d.timeZone,
   };
 }
 
+async function listCandidatesWithTransactions(d: WebDeps, billId: string) {
+  const candidates = await listCandidates(d.db, billId);
+  const withTransactions = [];
+  for (const candidate of candidates) {
+    const tx = await getTransaction(d.db, candidate.transactionId);
+    if (tx) withTransactions.push({ candidate, tx });
+  }
+  return withTransactions;
+}
+
+/**
+ * Exchanges the bank's code for a session (a network call, so before the transaction), then
+ * stores the session and its accounts in one transaction.
+ */
 async function completeBankSession(d: WebDeps, code: string, state: string): Promise<void> {
-  const aspsp = takeOauthState(d.db, d.clock, state);
+  const aspsp = await takeOauthState(d.db, d.clock, state);
   if (!aspsp) throw new AppError("invalid", "OAUTH_STATE_INVALID", "Unknown or expired state");
   const session = await d.feed.createSession(code);
-  withTransaction(d.db, () => {
-    saveSession(d.db, d.clock, {
-      sessionId: session.sessionId,
-      aspspName: aspsp.name,
-      aspspCountry: aspsp.country,
-      validUntil: session.validUntil,
-      accounts: session.accounts.map((a) => ({
-        // nova: IBAN is the identity that survives a consent renewal; a bank that sends none
-        // starts a fresh account row on renewal. Fine for Erste/Revolut, which send IBANs.
-        accountKey: a.iban ? `iban:${a.iban.replace(/\s+/g, "").toUpperCase()}` : `uid:${a.uid}`,
-        providerUid: a.uid,
-        iban: a.iban,
-        name: a.name,
-        currency: a.currency,
-      })),
-    });
-  });
-}
-
-type Handler = (
-  d: WebDeps,
-  req: IncomingMessage,
-  res: ServerResponse,
-  params: string[],
-) => Promise<void> | void;
-
-const routes: { method: string; pattern: RegExp; handler: Handler }[] = [
-  {
-    method: "GET",
-    pattern: /^\/$/,
-    handler: (d, req, res) => {
-      const url = new URL(req.url ?? "/", URL_BASE);
-      const filter = filterSchema.parse(url.searchParams.get("filter") ?? "all");
-      const today = todayIn(d.clock, d.timeZone);
-      sendHtml(
-        res,
-        200,
-        layout("Számlák", getStatusBar(d), billsPage(listActiveBills(d.db), today, filter)),
-      );
-    },
-  },
-  {
-    method: "GET",
-    pattern: /^\/bills\/([^/]+)$/,
-    handler: (d, _req, res, [id = ""]) => {
-      const bill = getBill(d.db, parseInput(uuid, id));
-      if (!bill) throw new AppError("not_found", "BILL_NOT_FOUND", "No such bill");
-      const matchedTx = bill.match_transaction_id
-        ? getTransaction(d.db, bill.match_transaction_id)
-        : undefined;
-      const candidates = matchedTx
-        ? []
-        : listCandidates(d.db, bill.id).flatMap((c) => {
-            const tx = getTransaction(d.db, c.transactionId);
-            return tx ? [{ candidate: c, tx }] : [];
-          });
-      const today = todayIn(d.clock, d.timeZone);
-      sendHtml(
-        res,
-        200,
-        layout(
-          `${bill.supplier_name} · ${bill.invoice_number}`,
-          getStatusBar(d),
-          billPage(bill, today, matchedTx, candidates),
-        ),
-      );
-    },
-  },
-  {
-    method: "GET",
-    pattern: /^\/bills\/([^/]+)\/file$/,
-    handler: (d, _req, res, [id = ""]) => {
-      const bill = getBill(d.db, parseInput(uuid, id));
-      const item = bill ? getInboundItem(d.db, bill.inbound_item_id) : undefined;
-      if (!item) throw new AppError("not_found", "FILE_NOT_FOUND", "No such file");
-      sendFile(d, res, item);
-    },
-  },
-  {
-    method: "POST",
-    pattern: /^\/bills\/([^/]+)\/match$/,
-    handler: async (d, req, res, [id = ""]) => {
-      const billId = parseInput(uuid, id);
-      const form = parseInput(matchForm, await readForm(req));
-      confirmMatch(d.db, d.clock, billId, form.transactionId);
-      redirect(res, `/bills/${billId}`);
-    },
-  },
-  {
-    method: "POST",
-    pattern: /^\/bills\/([^/]+)\/unmatch$/,
-    handler: (d, _req, res, [id = ""]) => {
-      const billId = parseInput(uuid, id);
-      revokeMatch(d.db, d.clock, billId);
-      redirect(res, `/bills/${billId}`);
-    },
-  },
-  {
-    method: "POST",
-    pattern: /^\/bills\/([^/]+)\/dismiss$/,
-    handler: (d, _req, res, [id = ""]) => {
-      dismissBill(d.db, parseInput(uuid, id));
-      redirect(res, "/");
-    },
-  },
-  {
-    method: "GET",
-    pattern: /^\/inbox$/,
-    handler: (d, _req, res) => {
-      sendHtml(
-        res,
-        200,
-        layout(
-          "Kézi beavatkozás kell",
-          getStatusBar(d),
-          inboxPage(listDeadLetteredInboundItems(d.db), d.timeZone),
-        ),
-      );
-    },
-  },
-  {
-    method: "GET",
-    pattern: /^\/inbox\/([^/]+)\/file$/,
-    handler: (d, _req, res, [id = ""]) => {
-      const item = getInboundItem(d.db, parseInput(uuid, id));
-      if (!item) throw new AppError("not_found", "FILE_NOT_FOUND", "No such file");
-      sendFile(d, res, item);
-    },
-  },
-  {
-    method: "POST",
-    pattern: /^\/inbox\/([^/]+)\/retry$/,
-    handler: (d, _req, res, [id = ""]) => {
-      requeueInboundItem(d.db, d.clock, parseInput(uuid, id));
-      void d.poller.trigger();
-      redirect(res, "/inbox");
-    },
-  },
-  {
-    method: "POST",
-    pattern: /^\/sync$/,
-    handler: (d, _req, res) => {
-      void d.poller.trigger({ forceBank: false });
-      redirect(res, "/");
-    },
-  },
-  {
-    method: "GET",
-    pattern: /^\/bank$/,
-    handler: async (d, req, res) => {
-      const url = new URL(req.url ?? "/", URL_BASE);
-      const message = url.searchParams.get("ok") === "1" ? "A bankkapcsolat elmentve." : null;
-      let aspsps: { name: string; country: string }[] | { error: string };
-      try {
-        aspsps = await d.feed.listAspsps(ASPSP_COUNTRY);
-      } catch (err: unknown) {
-        aspsps = { error: errorText(err, { maxChars: 200 }) };
-      }
-      sendHtml(
-        res,
-        200,
-        layout(
-          "Bankkapcsolat",
-          getStatusBar(d),
-          bankPage(listAccounts(d.db), aspsps, message, d.timeZone),
-        ),
-      );
-    },
-  },
-  {
-    method: "POST",
-    pattern: /^\/bank\/connect$/,
-    handler: async (d, req, res) => {
-      const wanted = parseInput(connectForm, await readForm(req));
-      const aspsp = (await d.feed.listAspsps(wanted.country)).find((a) => a.name === wanted.name);
-      if (!aspsp) throw new AppError("invalid", "ASPSP_UNKNOWN", "Unknown bank");
-      const seconds = Math.min(aspsp.maxConsentSeconds, MAX_CONSENT_SECONDS);
-      const validUntil = new Date(d.clock.now().getTime() + seconds * 1000).toISOString();
-      const state = randomBytes(OAUTH_STATE_BYTES).toString("base64url");
-      saveOauthState(
-        d.db,
-        state,
-        aspsp,
-        new Date(d.clock.now().getTime() + OAUTH_STATE_TTL_MS).toISOString(),
-      );
-      const { url } = await d.feed.startAuthorisation({
-        aspsp: { name: aspsp.name, country: aspsp.country },
-        state,
-        validUntil,
-        redirectUrl: d.redirectUrl,
-      });
-      if (!isBankLoginUrl(url)) {
-        throw new AppError(
-          "invalid",
-          "AUTH_URL_UNEXPECTED",
-          `Unexpected bank login address: ${new URL(url).hostname}`,
-        );
-      }
-      redirect(res, url);
-    },
-  },
-  {
-    method: "GET",
-    pattern: /^\/bank\/callback$/,
-    handler: async (d, req, res) => {
-      const url = new URL(req.url ?? "/", URL_BASE);
-      const code = url.searchParams.get("code");
-      const state = url.searchParams.get("state");
-      if (!code || !state) {
-        // Any site can send the browser here; its text is logged, never shown as ours.
-        d.log.warn(
-          { error: url.searchParams.get("error")?.slice(0, 200) },
-          "bank callback without code",
-        );
-        throw new AppError("invalid", "BANK_AUTH_DECLINED", "A bank nem adott hozzáférést.");
-      }
-      await completeBankSession(d, code, state);
-      void d.poller.trigger({ forceBank: true });
-      redirect(res, "/bank?ok=1");
-    },
-  },
-  {
-    method: "POST",
-    pattern: /^\/bank\/callback-paste$/,
-    handler: async (d, req, res) => {
-      const pasted = new URL(parseInput(pasteForm, await readForm(req)).url);
-      const code = pasted.searchParams.get("code");
-      const state = pasted.searchParams.get("state");
-      if (!code || !state)
-        throw new AppError("invalid", "BANK_AUTH_DECLINED", "The address has no code");
-      await completeBankSession(d, code, state);
-      void d.poller.trigger({ forceBank: true });
-      redirect(res, "/bank?ok=1");
-    },
-  },
-  {
-    method: "GET",
-    pattern: /^\/style\.css$/,
-    handler: (_d, _req, res) => {
-      res.writeHead(200, {
-        "content-type": "text/css; charset=utf-8",
-        "cache-control": "max-age=300",
-      });
-      res.end(STYLE);
-    },
-  },
-];
-
-const STATUS_FOR: Record<ReturnType<typeof categoryOf>, number> = {
-  invalid: 400,
-  not_found: 404,
-  conflict: 409,
-  reauth: 502,
-  transient: 503,
-};
-
-export function createWebServer(d: WebDeps): Server {
-  return createServer((req, res) => {
-    const method = req.method ?? "GET";
-    const guard = guardRequest(method, req.headers, d.port);
-    if (!guard.ok) {
-      d.log.warn({ method, url: req.url, reason: guard.reason }, "request refused");
-      res.writeHead(guard.status, { "content-type": "text/plain" });
-      res.end(guard.reason);
-      return;
-    }
-    const pathname = new URL(req.url ?? "/", URL_BASE).pathname;
-    for (const r of routes) {
-      if (r.method !== method) continue;
-      const m = r.pattern.exec(pathname);
-      if (!m) continue;
-      // Promise.resolve().then: a handler that throws synchronously lands in the same catch.
-      Promise.resolve()
-        .then(() => r.handler(d, req, res, m.slice(1)))
-        .catch((err: unknown) => {
-          const status = STATUS_FOR[categoryOf(err)];
-          d.log.warn(
-            { method, pathname, code: codeOf(err), err: errorText(err) },
-            "request failed",
-          );
-          if (res.headersSent) {
-            res.end();
-            return;
-          }
-          const message = err instanceof AppError ? `${err.code}: ${err.message}` : "Váratlan hiba";
-          sendHtml(res, status, layout("Hiba", getStatusBar(d), htmlError(message)));
-        });
-      return;
-    }
-    sendHtml(
-      res,
-      404,
-      layout("Nincs ilyen oldal", getStatusBar(d), htmlError("Nincs ilyen oldal.")),
-    );
-  });
-}
-
-function htmlError(message: string): Html {
-  return html`<p class="bad">${message}</p>
-    <p><a href="/">Vissza a számlákhoz</a></p>`;
+  const newSession = {
+    sessionId: session.sessionId,
+    aspspName: aspsp.name,
+    aspspCountry: aspsp.country,
+    validUntil: session.validUntil,
+    accounts: session.accounts.map((a) => ({
+      // nova: IBAN is the identity that survives a consent renewal; a bank that sends none
+      // starts a fresh account row on renewal. Fine for Erste/Revolut, which send IBANs.
+      accountKey: a.iban ? `iban:${a.iban.replace(/\s+/g, "").toUpperCase()}` : `uid:${a.uid}`,
+      providerUid: a.uid,
+      iban: a.iban,
+      name: a.name,
+      currency: a.currency,
+    })),
+  };
+  await d.db.transaction().execute((trx) => saveSession(trx, d.clock, newSession));
 }

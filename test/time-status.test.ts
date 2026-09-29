@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { test } from "vitest";
 import { billState } from "../src/bills/status.ts";
 import { addDays, isCalendarDate, todayIn } from "../src/shared/time.ts";
 

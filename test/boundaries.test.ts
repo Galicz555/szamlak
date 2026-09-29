@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { generateKeyPairSync, verify } from "node:crypto";
-import { test } from "node:test";
+import { test } from "vitest";
 import { signJwt, toTransactions } from "../src/bank/enable-banking.ts";
 import { errorText } from "../src/log.ts";
 import { isAddressedToUs, isSenderAuthenticated } from "../src/mail/sender-auth.ts";

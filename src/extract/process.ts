@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
-import type { DatabaseSync } from "node:sqlite";
+import type { Kysely, Transaction } from "kysely";
 import type { Logger } from "pino";
 import { z } from "zod";
 import {
@@ -9,8 +9,9 @@ import {
   markInboundProcessed,
   listQueuedInboundItems,
   type InboundItem,
+  type NewBill,
 } from "../bills/repo.ts";
-import { withTransaction } from "../db/db.ts";
+import type { Database } from "../db/schema.ts";
 import { AppError, categoryOf, codeOf } from "../errors.ts";
 import { errorText } from "../log.ts";
 import type { Clock } from "../shared/time.ts";
@@ -20,7 +21,7 @@ import { extractionSchema, type Extraction } from "./schema.ts";
 import { verifyExtraction, type Verdict } from "./verify.ts";
 
 export interface ExtractDeps {
-  db: DatabaseSync;
+  db: Kysely<Database>;
   clock: Clock;
   log: Logger;
   extractor: BillExtractor;
@@ -73,7 +74,7 @@ export async function processQueue(
 ): Promise<{ done: number; failed: number }> {
   let done = 0;
   let failed = 0;
-  for (const item of listQueuedInboundItems(deps.db)) {
+  for (const item of await listQueuedInboundItems(deps.db)) {
     try {
       await processItem(deps, settings, item);
       done++;
@@ -82,7 +83,7 @@ export async function processQueue(
       // anyone's attempts, and let the run record the outage.
       if (codeOf(err) === "EXTRACTOR_UNREACHABLE") throw err;
       failed++;
-      saveItemFailure(deps, settings, item, err);
+      await saveItemFailure(deps, settings, item, err);
     }
   }
   return { done, failed };
@@ -94,7 +95,7 @@ async function processItem(
   item: InboundItem,
 ): Promise<void> {
   const text = await fetchItemText(settings.dataDir, item);
-  saveOutcome(deps, item, await extractVerified(deps.extractor, text));
+  await saveOutcome(deps, item, await extractVerified(deps.extractor, text));
 }
 
 function fetchItemText(dataDir: string, item: InboundItem): Promise<string> {
@@ -103,45 +104,57 @@ function fetchItemText(dataDir: string, item: InboundItem): Promise<string> {
 }
 
 /** Records the item as processed; a rejected verdict throws, so it is recorded as a failure. */
-function saveOutcome(
+async function saveOutcome(
   { db, clock, extractor }: ExtractDeps,
   item: InboundItem,
   { verdict, extraction }: ExtractionOutcome,
-): void {
+): Promise<void> {
   switch (verdict.kind) {
     case "not_a_bill":
     case "nothing_to_pay":
-      markInboundProcessed(db, clock, item.id, verdict.kind);
+      await markInboundProcessed(db, clock, item.id, verdict.kind);
       return;
     case "rejected":
       throw new AppError("invalid", "EXTRACTION_UNVERIFIED", verdict.problems.join("; "));
     case "bill": {
-      // One transaction: a bill without its item marked would be re-read as a duplicate.
-      withTransaction(db, () => {
-        const created = insertBill(db, clock, {
-          inboundItemId: item.id,
-          senderDomain: item.sender_domain,
-          ...verdict.bill,
-          extractionJson: JSON.stringify(extraction),
-          extractor: extractor.name,
-        });
-        markInboundProcessed(db, clock, item.id, created ? "bill_created" : "duplicate_bill");
-      });
+      const bill: NewBill = {
+        inboundItemId: item.id,
+        senderDomain: item.sender_domain,
+        ...verdict.bill,
+        extractionJson: JSON.stringify(extraction),
+        extractor: extractor.name,
+      };
+      await db.transaction().execute((trx) => saveBillIn(trx, clock, item, bill));
       return;
     }
   }
 }
 
+/** One transaction: a bill without its item marked would be re-read as a duplicate. */
+async function saveBillIn(
+  trx: Transaction<Database>,
+  clock: Clock,
+  item: InboundItem,
+  bill: NewBill,
+): Promise<void> {
+  const created = await insertBill(trx, clock, bill);
+  await markInboundProcessed(trx, clock, item.id, created ? "bill_created" : "duplicate_bill");
+}
+
 /** Counts the attempt; a non-transient failure or the last allowed attempt dead-letters the item. */
-function saveItemFailure(
+async function saveItemFailure(
   { db, clock, log }: ExtractDeps,
   settings: ExtractSettings,
   item: InboundItem,
   err: unknown,
-): void {
+): Promise<void> {
   const exhausted = item.attempt_count + 1 >= settings.maxAttempts;
   const deadLetter = categoryOf(err) !== "transient" || exhausted;
-  markInboundFailed(db, clock, item.id, { code: codeOf(err), message: errorText(err), deadLetter });
+  await markInboundFailed(db, clock, item.id, {
+    code: codeOf(err),
+    message: errorText(err),
+    deadLetter,
+  });
   log.warn(
     { itemId: item.id, code: codeOf(err), deadLetter, err: errorText(err) },
     "extract failed",

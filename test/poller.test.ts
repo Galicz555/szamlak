@@ -2,10 +2,11 @@ import assert from "node:assert/strict";
 import { mkdtempSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import type { DatabaseSync } from "node:sqlite";
-import { test } from "node:test";
+import { sql, type Kysely } from "kysely";
+import { test } from "vitest";
 import type { Logger } from "pino";
 import type { BankFeed } from "../src/bank/enable-banking.ts";
+import type { Database } from "../src/db/schema.ts";
 import type { BillExtractor } from "../src/extract/extractors.ts";
 import type { Mailbox } from "../src/mail/mailbox.ts";
 import { Poller } from "../src/poll/poller.ts";
@@ -28,7 +29,7 @@ const unusedFeed: BankFeed = {
 };
 
 function makePoller(
-  db: DatabaseSync,
+  db: Kysely<Database>,
   clock: Clock,
   {
     mailbox = emptyMailbox,
@@ -58,11 +59,18 @@ function makePoller(
   return { poller, backupDir };
 }
 
-const outcomes = (db: DatabaseSync, kind: string): unknown[] =>
-  db
-    .prepare("SELECT outcome FROM poll_run WHERE kind = ? ORDER BY rowid")
-    .all(kind)
-    .map((row) => row.outcome);
+const outcomes = async (
+  db: Kysely<Database>,
+  kind: "mail" | "extract" | "bank" | "backup",
+): Promise<unknown[]> =>
+  (
+    await db
+      .selectFrom("poll_run")
+      .select("outcome")
+      .where("kind", "=", kind)
+      .orderBy(sql`rowid`)
+      .execute()
+  ).map((row) => row.outcome);
 
 test("the bank is fetched at most every BANK_POLL_HOURS, unless a person forces it", async () => {
   const db = memDb();
@@ -71,19 +79,19 @@ test("the bank is fetched at most every BANK_POLL_HOURS, unless a person forces 
 
   await poller.trigger();
   await poller.trigger();
-  assert.equal(outcomes(db, "bank").length, 1);
+  assert.equal((await outcomes(db, "bank")).length, 1);
   await poller.trigger({ forceBank: true });
-  assert.equal(outcomes(db, "bank").length, 2);
+  assert.equal((await outcomes(db, "bank")).length, 2);
   clock.set("2026-09-20T15:59:00Z");
   await poller.trigger();
-  assert.equal(outcomes(db, "bank").length, 2);
+  assert.equal((await outcomes(db, "bank")).length, 2);
   clock.set("2026-09-20T16:00:00Z");
   await poller.trigger();
-  assert.equal(outcomes(db, "bank").length, 3);
+  assert.equal((await outcomes(db, "bank")).length, 3);
 
-  assert.equal(outcomes(db, "mail").length, 5);
-  assert.equal(outcomes(db, "extract").length, 5);
-  assert.equal(outcomes(db, "backup").length, 0);
+  assert.equal((await outcomes(db, "mail")).length, 5);
+  assert.equal((await outcomes(db, "extract")).length, 5);
+  assert.equal((await outcomes(db, "backup")).length, 0);
 });
 
 test("a failed stage is recorded as an error and the rest of the pass still runs", async () => {
@@ -93,9 +101,9 @@ test("a failed stage is recorded as an error and the rest of the pass still runs
   const { poller } = makePoller(db, clock, { mailbox });
 
   await poller.trigger();
-  assert.deepEqual(outcomes(db, "mail"), ["error"]);
-  assert.deepEqual(outcomes(db, "extract"), ["ok"]);
-  assert.deepEqual(outcomes(db, "bank"), ["ok"]);
+  assert.deepEqual(await outcomes(db, "mail"), ["error"]);
+  assert.deepEqual(await outcomes(db, "extract"), ["ok"]);
+  assert.deepEqual(await outcomes(db, "bank"), ["ok"]);
 });
 
 test("a trigger during a running pass joins it instead of starting another", async () => {
@@ -109,7 +117,7 @@ test("a trigger during a running pass joins it instead of starting another", asy
   assert.ok(poller.running);
   await first;
   assert.ok(!poller.running);
-  assert.equal(outcomes(db, "mail").length, 1);
+  assert.equal((await outcomes(db, "mail")).length, 1);
 });
 
 test("the backup runs once per calendar day in the configured time zone", async () => {
@@ -119,11 +127,11 @@ test("the backup runs once per calendar day in the configured time zone", async 
 
   await poller.trigger();
   await poller.trigger();
-  assert.deepEqual(outcomes(db, "backup"), ["ok"]);
+  assert.deepEqual(await outcomes(db, "backup"), ["ok"]);
   // 22:30 UTC is already the next day in Budapest (UTC+2 in September).
   clock.set("2026-09-20T22:30:00Z");
   await poller.trigger();
-  assert.deepEqual(outcomes(db, "backup"), ["ok", "ok"]);
+  assert.deepEqual(await outcomes(db, "backup"), ["ok", "ok"]);
   assert.deepEqual(
     readdirSync(backupDir)
       .filter((f) => f.endsWith(".db"))
@@ -146,10 +154,10 @@ test("an error between the stages is logged and the pass still resolves", async 
   await poller.trigger();
   assert.ok(!poller.running);
   assert.ok(entries.some((e) => e.msg === "pass failed" && typeof e.err === "string"));
-  assert.deepEqual(outcomes(db, "backup"), []);
-  assert.deepEqual(outcomes(db, "mail"), ["ok"]);
+  assert.deepEqual(await outcomes(db, "backup"), []);
+  assert.deepEqual(await outcomes(db, "mail"), ["ok"]);
 
   // The lock was released: the next trigger starts a new pass.
   await poller.trigger();
-  assert.deepEqual(outcomes(db, "mail"), ["ok", "ok"]);
+  assert.deepEqual(await outcomes(db, "mail"), ["ok", "ok"]);
 });

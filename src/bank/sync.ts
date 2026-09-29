@@ -1,6 +1,6 @@
-import type { DatabaseSync } from "node:sqlite";
 import type { Logger } from "pino";
-import { withTransaction } from "../db/db.ts";
+import type { Kysely } from "kysely";
+import type { Database } from "../db/schema.ts";
 import { AppError } from "../errors.ts";
 import { errorText } from "../log.ts";
 import { addDays, instant, todayIn, type Clock } from "../shared/time.ts";
@@ -8,7 +8,7 @@ import type { BankFeed } from "./enable-banking.ts";
 import { insertTransactions, listAccounts } from "./repo.ts";
 
 export interface BankSyncDeps {
-  db: DatabaseSync;
+  db: Kysely<Database>;
   clock: Clock;
   log: Logger;
   feed: BankFeed;
@@ -37,7 +37,7 @@ export async function syncBank(
   const failures: string[] = [];
   let inserted = 0;
 
-  for (const account of listAccounts(db)) {
+  for (const account of await listAccounts(db)) {
     if (account.valid_until < now) {
       failures.push(`${account.aspsp_name}: consent expired`);
       continue;
@@ -46,8 +46,11 @@ export async function syncBank(
       ? addDays(account.last_booking_date, -OVERLAP_DAYS)
       : addDays(today, -settings.lookbackDays);
     try {
+      // Fetched before the transaction opens: no network call ever runs inside one.
       const txs = await feed.bookedTransactions(account.provider_uid, from, today);
-      inserted += withTransaction(db, () => insertTransactions(db, clock, account.id, txs));
+      inserted += await db
+        .transaction()
+        .execute((trx) => insertTransactions(trx, clock, account.id, txs));
     } catch (err: unknown) {
       failures.push(
         `${account.aspsp_name} ${account.name ?? ""}: ${errorText(err, { maxChars: 200 })}`,

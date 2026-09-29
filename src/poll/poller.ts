@@ -1,7 +1,8 @@
-import type { DatabaseSync } from "node:sqlite";
+import type { Kysely } from "kysely";
 import type { Logger } from "pino";
 import type { BankFeed } from "../bank/enable-banking.ts";
 import { syncBank, type BankSyncSettings } from "../bank/sync.ts";
+import type { Database } from "../db/schema.ts";
 import type { BillExtractor } from "../extract/extractors.ts";
 import { processQueue, type ExtractSettings } from "../extract/process.ts";
 import { errorText } from "../log.ts";
@@ -13,7 +14,7 @@ import { backup } from "./backup.ts";
 import { finishRun, getLastSuccessAt, startRun, type RunKind } from "./runs.ts";
 
 export interface PollerDeps {
-  db: DatabaseSync;
+  db: Kysely<Database>;
   clock: Clock;
   log: Logger;
   mailbox: Mailbox;
@@ -79,11 +80,11 @@ export class Poller {
     const { deps, settings } = this;
     await this.stage("mail", () => ingestMail(deps, settings.mail));
     await this.stage("extract", () => processQueue(deps, settings.extract));
-    if (this.isBankDue(forceBank)) {
+    if (await this.isBankDue(forceBank)) {
       await this.stage("bank", () => syncBank(deps, settings.bank));
     }
-    this.matchBills();
-    if (this.isBackupDue()) {
+    await this.matchBills();
+    if (await this.isBackupDue()) {
       const { dataDir, backupDir, keep, timeZone } = settings.backup;
       await this.stage("backup", () =>
         backup(deps.db, { dataDir, backupDir, today: todayIn(deps.clock, timeZone), keep }),
@@ -93,40 +94,40 @@ export class Poller {
 
   private async stage(kind: RunKind, work: () => Promise<unknown>): Promise<void> {
     const { db, clock, log } = this.deps;
-    const id = startRun(db, clock, kind);
+    const id = await startRun(db, clock, kind);
     try {
       const result = await work();
-      finishRun(db, clock, id, { error: null });
+      await finishRun(db, clock, id, { error: null });
       log.info({ kind, result }, "stage ok");
     } catch (err: unknown) {
-      finishRun(db, clock, id, { error: errorText(err) });
+      await finishRun(db, clock, id, { error: errorText(err) });
       log.error({ kind, err: errorText(err) }, "stage failed");
     }
   }
 
-  private isBankDue(force: boolean): boolean {
+  private async isBankDue(force: boolean): Promise<boolean> {
     if (force) return true;
-    const last = getLastSuccessAt(this.deps.db, "bank");
+    const last = await getLastSuccessAt(this.deps.db, "bank");
     if (!last) return true;
     const elapsedMs = this.deps.clock.now().getTime() - Date.parse(last);
     return elapsedMs >= this.settings.bank.pollHours * 3_600_000;
   }
 
   /** Auto-matching records no run of its own; a failure is logged and the pass goes on. */
-  private matchBills(): void {
+  private async matchBills(): Promise<void> {
     const { db, clock, log } = this.deps;
     try {
-      const matched = runAutoMatch(db, clock);
+      const matched = await runAutoMatch(db, clock);
       if (matched > 0) log.info({ matched }, "auto-matched");
     } catch (err: unknown) {
       log.error({ err: errorText(err) }, "auto-match failed");
     }
   }
 
-  private isBackupDue(): boolean {
+  private async isBackupDue(): Promise<boolean> {
     const { enabled, timeZone } = this.settings.backup;
     if (!enabled) return false;
-    const last = getLastSuccessAt(this.deps.db, "backup");
+    const last = await getLastSuccessAt(this.deps.db, "backup");
     const today = todayIn(this.deps.clock, timeZone);
     return !last || todayIn({ now: () => new Date(last) }, timeZone) !== today;
   }

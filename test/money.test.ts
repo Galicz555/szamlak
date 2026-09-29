@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { test } from "vitest";
 import { formatMinor, parseAmountMinor, parseDecimalMinor } from "../src/shared/money.ts";
 
 test("parseAmountMinor reads the ways Hungarian bills print amounts", () => {

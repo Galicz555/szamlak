@@ -1,5 +1,7 @@
 -- Identifiers are UUID v4 text. Instants are RFC 3339 UTC text ('...Z'). Calendar dates are 'YYYY-MM-DD'.
 -- Money is INTEGER minor units plus an ISO 4217 currency.
+-- Every table is STRICT: a value of the wrong storage class is refused, so the column types the
+-- code relies on (src/db/schema.ts) hold for every row.
 
 CREATE TABLE inbound_item (
   id              TEXT PRIMARY KEY,
@@ -24,7 +26,7 @@ CREATE TABLE inbound_item (
   result_code     TEXT,
   created_at      TEXT NOT NULL,
   updated_at      TEXT NOT NULL
-);
+) STRICT;
 CREATE INDEX inbound_item_status ON inbound_item (status);
 
 CREATE TABLE bill (
@@ -47,7 +49,7 @@ CREATE TABLE bill (
   extractor        TEXT NOT NULL,
   created_at       TEXT NOT NULL,
   UNIQUE (sender_domain, invoice_number_norm)
-);
+) STRICT;
 
 CREATE TABLE bank_session (
   id           TEXT PRIMARY KEY,
@@ -57,7 +59,7 @@ CREATE TABLE bank_session (
   aspsp_country TEXT NOT NULL,
   valid_until  TEXT NOT NULL,
   created_at   TEXT NOT NULL
-);
+) STRICT;
 
 CREATE TABLE bank_account (
   id           TEXT PRIMARY KEY,
@@ -71,7 +73,7 @@ CREATE TABLE bank_account (
   currency     TEXT,
   created_at   TEXT NOT NULL,
   updated_at   TEXT NOT NULL
-);
+) STRICT;
 
 CREATE TABLE bank_transaction (
   id              TEXT PRIMARY KEY,
@@ -86,7 +88,7 @@ CREATE TABLE bank_transaction (
   remittance      TEXT NOT NULL,
   created_at      TEXT NOT NULL,
   UNIQUE (account_id, provider_tx_key)
-);
+) STRICT;
 CREATE INDEX bank_transaction_booking ON bank_transaction (booking_date);
 
 CREATE TABLE bill_match (
@@ -98,7 +100,7 @@ CREATE TABLE bill_match (
   matched_at     TEXT NOT NULL,
   -- Revoking keeps the row as history; only active rows count.
   revoked_at     TEXT
-);
+) STRICT;
 -- One transaction pays at most one bill; one bill has at most one active match.
 CREATE UNIQUE INDEX bill_match_active_tx ON bill_match (transaction_id) WHERE revoked_at IS NULL;
 CREATE UNIQUE INDEX bill_match_active_bill ON bill_match (bill_id) WHERE revoked_at IS NULL;
@@ -107,7 +109,7 @@ CREATE TABLE mail_cursor (
   mailbox      TEXT PRIMARY KEY,
   uid_validity TEXT NOT NULL,
   last_uid     INTEGER NOT NULL
-);
+) STRICT;
 
 CREATE TABLE poll_run (
   id          TEXT PRIMARY KEY,
@@ -116,7 +118,7 @@ CREATE TABLE poll_run (
   finished_at TEXT,
   outcome     TEXT CHECK (outcome IN ('ok', 'error')),
   error       TEXT
-);
+) STRICT;
 CREATE INDEX poll_run_kind ON poll_run (kind, started_at);
 
 CREATE TABLE oauth_state (
@@ -124,4 +126,4 @@ CREATE TABLE oauth_state (
   aspsp_name  TEXT NOT NULL,
   aspsp_country TEXT NOT NULL,
   expires_at  TEXT NOT NULL
-);
+) STRICT;

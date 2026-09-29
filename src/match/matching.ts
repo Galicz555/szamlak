@@ -1,10 +1,8 @@
 import { randomUUID } from "node:crypto";
-import type { DatabaseSync } from "node:sqlite";
-import { z } from "zod";
+import type { Kysely, Transaction } from "kysely";
 import { listUnmatchedDebits, type TransactionRow } from "../bank/repo.ts";
 import { getBill, listUnmatchedBills, type BillRow } from "../bills/repo.ts";
-import { withTransaction } from "../db/db.ts";
-import { parseRows } from "../db/rows.ts";
+import type { Database } from "../db/schema.ts";
 import { AppError } from "../errors.ts";
 import { instant, type Clock } from "../shared/time.ts";
 import {
@@ -39,98 +37,124 @@ const toMatchTx = (t: TransactionRow): MatchTx => ({
   remittance: t.remittance,
 });
 
-function insertMatch(
-  db: DatabaseSync,
+/** Inside the transaction that checked the bill and the transaction are still free. */
+async function insertMatch(
+  trx: Transaction<Database>,
   clock: Clock,
   billId: string,
   transactionId: string,
   method: "auto" | "manual",
   reason: string,
-): void {
-  db.prepare(
-    `INSERT INTO bill_match (id, bill_id, transaction_id, method, reason, matched_at)
-     VALUES (?, ?, ?, ?, ?, ?)`,
-  ).run(randomUUID(), billId, transactionId, method, reason, instant(clock));
+): Promise<void> {
+  await trx
+    .insertInto("bill_match")
+    .values({
+      id: randomUUID(),
+      bill_id: billId,
+      transaction_id: transactionId,
+      method,
+      reason,
+      matched_at: instant(clock),
+    })
+    .execute();
 }
 
 /** Transactions a person has un-matched from this bill; auto-matching must not re-pick them. */
-function listRevokedTxIds(db: DatabaseSync, billId: string): Set<string> {
-  const rows = parseRows(
-    z.object({ transaction_id: z.string() }),
-    db
-      .prepare(`SELECT transaction_id FROM bill_match WHERE bill_id = ? AND revoked_at IS NOT NULL`)
-      .all(billId),
-  );
+async function listRevokedTxIds(db: Kysely<Database>, billId: string): Promise<Set<string>> {
+  const rows = await db
+    .selectFrom("bill_match")
+    .select("transaction_id")
+    .where("bill_id", "=", billId)
+    .where("revoked_at", "is not", null)
+    .execute();
   return new Set(rows.map((r) => r.transaction_id));
 }
 
 /**
  * Auto-matches every unmatched bill it safely can, oldest due date first, so this month's
- * identical Telekom fee cannot claim last month's payment. One transaction, synchronous: the
- * partial unique indexes back up the "each transaction once" rule.
+ * identical Telekom fee cannot claim last month's payment. One transaction: each bill sees the
+ * matches made for the bills before it, and the partial unique indexes back up the "each
+ * transaction once" rule.
  */
-export function runAutoMatch(db: DatabaseSync, clock: Clock): number {
-  return withTransaction(db, () => {
-    let matched = 0;
-    for (const bill of listUnmatchedBills(db)) {
-      const mb = toMatchBill(bill);
-      const { from, to } = searchWindow(mb);
-      const revoked = listRevokedTxIds(db, bill.id);
-      const txs = listUnmatchedDebits(db, from, to).filter((t) => !revoked.has(t.id));
-      const decision = decide(candidatesFor(mb, txs.map(toMatchTx)));
-      if (decision.kind !== "auto") continue;
-      insertMatch(
-        db,
-        clock,
-        bill.id,
-        decision.candidate.transactionId,
-        "auto",
-        decision.candidate.evidence.join(", "),
-      );
-      matched++;
-    }
-    return matched;
-  });
+export function runAutoMatch(db: Kysely<Database>, clock: Clock): Promise<number> {
+  return db.transaction().execute((trx) => autoMatchIn(trx, clock));
+}
+
+async function autoMatchIn(trx: Transaction<Database>, clock: Clock): Promise<number> {
+  let matched = 0;
+  for (const bill of await listUnmatchedBills(trx)) {
+    const mb = toMatchBill(bill);
+    const { from, to } = searchWindow(mb);
+    const revoked = await listRevokedTxIds(trx, bill.id);
+    const txs = (await listUnmatchedDebits(trx, from, to)).filter((t) => !revoked.has(t.id));
+    const decision = decide(candidatesFor(mb, txs.map(toMatchTx)));
+    if (decision.kind !== "auto") continue;
+    await insertMatch(
+      trx,
+      clock,
+      bill.id,
+      decision.candidate.transactionId,
+      "auto",
+      decision.candidate.evidence.join(", "),
+    );
+    matched++;
+  }
+  return matched;
 }
 
 /** Candidates for one bill, for the detail page. */
-export function listCandidates(db: DatabaseSync, billId: string): Candidate[] {
-  const bill = getBill(db, billId);
+export async function listCandidates(db: Kysely<Database>, billId: string): Promise<Candidate[]> {
+  const bill = await getBill(db, billId);
   if (!bill) return [];
   const mb = toMatchBill(bill);
   const { from, to } = searchWindow(mb);
-  return candidatesFor(mb, listUnmatchedDebits(db, from, to).map(toMatchTx));
+  return candidatesFor(mb, (await listUnmatchedDebits(db, from, to)).map(toMatchTx));
 }
 
 /** A person confirms a suggestion. Only a current candidate can be confirmed. */
-export function confirmMatch(
-  db: DatabaseSync,
+export async function confirmMatch(
+  db: Kysely<Database>,
   clock: Clock,
   billId: string,
   transactionId: string,
-): void {
-  withTransaction(db, () => {
-    const candidate = listCandidates(db, billId).find((c) => c.transactionId === transactionId);
-    if (!candidate) {
-      throw new AppError(
-        "conflict",
-        "MATCH_NOT_A_CANDIDATE",
-        "Transaction is not a candidate for this bill",
-      );
-    }
-    const bill = getBill(db, billId);
-    if (!bill || bill.match_id) {
-      throw new AppError("conflict", "MATCH_BILL_ALREADY_MATCHED", "Bill already has a match");
-    }
-    insertMatch(db, clock, billId, transactionId, "manual", candidate.evidence.join(", "));
-  });
+): Promise<void> {
+  await db.transaction().execute((trx) => confirmMatchIn(trx, clock, billId, transactionId));
+}
+
+async function confirmMatchIn(
+  trx: Transaction<Database>,
+  clock: Clock,
+  billId: string,
+  transactionId: string,
+): Promise<void> {
+  const candidate = (await listCandidates(trx, billId)).find(
+    (c) => c.transactionId === transactionId,
+  );
+  if (!candidate) {
+    throw new AppError(
+      "conflict",
+      "MATCH_NOT_A_CANDIDATE",
+      "Transaction is not a candidate for this bill",
+    );
+  }
+  const bill = await getBill(trx, billId);
+  if (!bill || bill.match_id) {
+    throw new AppError("conflict", "MATCH_BILL_ALREADY_MATCHED", "Bill already has a match");
+  }
+  await insertMatch(trx, clock, billId, transactionId, "manual", candidate.evidence.join(", "));
 }
 
 /** Revoking keeps the row as history, and that history stops auto-matching from re-picking the pair. */
-export function revokeMatch(db: DatabaseSync, clock: Clock, billId: string): boolean {
-  return (
-    db
-      .prepare(`UPDATE bill_match SET revoked_at = ? WHERE bill_id = ? AND revoked_at IS NULL`)
-      .run(instant(clock), billId).changes === 1
-  );
+export async function revokeMatch(
+  db: Kysely<Database>,
+  clock: Clock,
+  billId: string,
+): Promise<boolean> {
+  const result = await db
+    .updateTable("bill_match")
+    .set({ revoked_at: instant(clock) })
+    .where("bill_id", "=", billId)
+    .where("revoked_at", "is", null)
+    .executeTakeFirst();
+  return result.numUpdatedRows === 1n;
 }

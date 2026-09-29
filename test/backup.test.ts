@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { test } from "node:test";
+import { test } from "vitest";
 import { backup } from "../src/poll/backup.ts";
 import { memDb } from "./helpers.ts";
 

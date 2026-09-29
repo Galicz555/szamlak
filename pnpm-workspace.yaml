@@ -1,3 +1,7 @@
 # Single package; this file exists for pnpm settings only.
 # A release must be a week old before it installs (supply-chain guard, guide A§10.5).
 minimumReleaseAge: 10080
+# better-sqlite3 ships N-API prebuilds, so its install script (a node-gyp rebuild) is refused:
+# no dependency runs code at install time.
+allowBuilds:
+  better-sqlite3: false

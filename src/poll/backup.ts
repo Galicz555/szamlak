@@ -1,6 +1,7 @@
 import { copyFile, mkdir, readdir, rm } from "node:fs/promises";
 import path from "node:path";
-import type { DatabaseSync } from "node:sqlite";
+import { sql, type Kysely } from "kysely";
+import type { Database } from "../db/schema.ts";
 
 const SNAPSHOT_PREFIX = "szamlak-";
 
@@ -10,13 +11,13 @@ const SNAPSHOT_PREFIX = "szamlak-";
  * Older snapshots beyond `keep` are pruned; PDFs are never pruned.
  */
 export async function backup(
-  db: DatabaseSync,
+  db: Kysely<Database>,
   opts: { dataDir: string; backupDir: string; today: string; keep: number },
 ): Promise<string> {
   await mkdir(path.join(opts.backupDir, "files"), { recursive: true });
   const target = path.join(opts.backupDir, `${SNAPSHOT_PREFIX}${opts.today}.db`);
   await rm(target, { force: true });
-  db.prepare("VACUUM INTO ?").run(target);
+  await sql`VACUUM INTO ${target}`.execute(db);
 
   const filesDir = path.join(opts.dataDir, "files");
   const have = new Set(await readdir(path.join(opts.backupDir, "files")));
