@@ -5,6 +5,8 @@
  *   pnpm backup:verify
  */
 import { DatabaseSync } from "node:sqlite";
+import { z } from "zod";
+import { parseRow } from "../src/db/rows.ts";
 import { loadEnv } from "../src/env.ts";
 import { latestSnapshot } from "../src/poll/backup.ts";
 
@@ -15,9 +17,16 @@ if (!file) {
   process.exit(1);
 }
 const db = new DatabaseSync(file, { readOnly: true });
-const integrity = db.prepare("PRAGMA integrity_check").get()?.integrity_check;
-const version = db.prepare("PRAGMA user_version").get()?.user_version;
-const count = (table: string) => db.prepare(`SELECT count(*) AS n FROM ${table}`).get()?.n;
+const integrity = parseRow(
+  z.object({ integrity_check: z.string() }),
+  db.prepare("PRAGMA integrity_check").get(),
+)?.integrity_check;
+const version = parseRow(
+  z.object({ user_version: z.number() }),
+  db.prepare("PRAGMA user_version").get(),
+)?.user_version;
+const count = (table: string) =>
+  parseRow(z.object({ n: z.number() }), db.prepare(`SELECT count(*) AS n FROM ${table}`).get())?.n;
 console.log(`snapshot:        ${file}`);
 console.log(`integrity_check: ${String(integrity)}`);
 console.log(`schema version:  ${String(version)}`);

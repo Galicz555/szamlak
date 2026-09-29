@@ -12,6 +12,19 @@ const csv = z
   )
   .pipe(z.array(z.string()).min(1));
 
+const DEFAULT_GEMINI_MODEL = "gemini-2.5-flash";
+
+// A blank `.env` line (`GEMINI_API_KEY=`) means "not configured" for an optional setting.
+// Required settings keep failing on blank: min(1) still applies to them.
+const unsetIfEmpty = (value: unknown): unknown => (value === "" ? undefined : value);
+
+const extractorFields = {
+  LOCAL_LLM_URL: z.preprocess(unsetIfEmpty, z.url().optional()),
+  LOCAL_LLM_MODEL: z.preprocess(unsetIfEmpty, z.string().min(1).optional()),
+  GEMINI_API_KEY: z.preprocess(unsetIfEmpty, z.string().min(1).optional()),
+  GEMINI_MODEL: z.preprocess(unsetIfEmpty, z.string().min(1).default(DEFAULT_GEMINI_MODEL)),
+};
+
 const envSchema = z
   .object({
     APP_ENV: z.enum(["development", "production", "test"]),
@@ -37,14 +50,11 @@ const envSchema = z
     MAIL_TRUSTED_AUTHSERV: z.string().min(1).default("mx.google.com"),
     // Addresses bills are sent to; defaults to IMAP_USER. A bill addressed to someone else
     // (a genuine one re-sent by another customer) is ignored.
-    MAIL_RECIPIENTS: csv.optional(),
+    MAIL_RECIPIENTS: z.preprocess(unsetIfEmpty, csv.optional()),
     MAIL_LOOKBACK_DAYS: z.coerce.number().int().min(1).max(730).default(180),
 
     EXTRACTOR: z.enum(["local", "gemini"]),
-    LOCAL_LLM_URL: z.url().optional(),
-    LOCAL_LLM_MODEL: z.string().min(1).optional(),
-    GEMINI_API_KEY: z.string().min(1).optional(),
-    GEMINI_MODEL: z.string().min(1).default("gemini-2.5-flash"),
+    ...extractorFields,
     EXTRACT_MAX_ATTEMPTS: z.coerce.number().int().min(1).max(10).default(4),
 
     EB_APP_ID: z.string().min(1),
@@ -78,7 +88,8 @@ export type Env = Omit<z.infer<typeof envSchema>, "MAIL_RECIPIENTS"> & {
   MAIL_RECIPIENTS: string[];
 };
 
-/** The only reader of process.env. Throws with every problem listed; there are no secret fallbacks. */
+/** The app's configuration (this module is the only reader of process.env). Throws with every
+ * problem listed; there are no secret fallbacks. */
 export function loadEnv(source: NodeJS.ProcessEnv = process.env): Env {
   const parsed = envSchema.safeParse(source);
   if (!parsed.success) {
@@ -91,4 +102,20 @@ export function loadEnv(source: NodeJS.ProcessEnv = process.env): Env {
     BACKUP_DIR: path.resolve(env.BACKUP_DIR),
     MAIL_RECIPIENTS: env.MAIL_RECIPIENTS ?? [env.IMAP_USER.toLowerCase()],
   };
+}
+
+const extractorEnvSchema = z.object(extractorFields);
+
+export type ExtractorEnv = z.infer<typeof extractorEnvSchema>;
+
+/**
+ * Only the extractor settings, for `pnpm eval:extract`: it needs no mail or bank credentials, so
+ * it must not be made to supply them. Each extractor whose settings are all present is usable.
+ */
+export function loadExtractorEnv(source: NodeJS.ProcessEnv = process.env): ExtractorEnv {
+  const parsed = extractorEnvSchema.safeParse(source);
+  if (!parsed.success) {
+    throw new Error(`Invalid configuration:\n${z.prettifyError(parsed.error)}`);
+  }
+  return parsed.data;
 }

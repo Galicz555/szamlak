@@ -55,11 +55,18 @@ export class Poller {
     return this.current !== null;
   }
 
-  /** Starts a pass, or returns the one already running. Never rejects. */
+  /**
+   * Starts a pass, or returns the one already running. Never rejects: every caller discards the
+   * promise, so an error outside a stage (a failed DB read between stages) is logged here.
+   */
   trigger(opts: { forceBank?: boolean } = {}): Promise<void> {
-    this.current ??= this.pass(opts.forceBank ?? false).finally(() => {
-      this.current = null;
-    });
+    this.current ??= this.pass(opts.forceBank ?? false)
+      .catch((err: unknown) => {
+        this.deps.log.error({ err: errorText(err) }, "pass failed");
+      })
+      .finally(() => {
+        this.current = null;
+      });
     return this.current;
   }
 

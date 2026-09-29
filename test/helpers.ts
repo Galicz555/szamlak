@@ -1,5 +1,5 @@
 import type { DatabaseSync } from "node:sqlite";
-import type { Logger } from "pino";
+import pino, { type Logger } from "pino";
 import { migrate, openDb } from "../src/db/db.ts";
 import { createLogger } from "../src/log.ts";
 import type { Clock } from "../src/shared/time.ts";
@@ -22,6 +22,20 @@ export function fixedClock(iso: string): Clock & { set(iso: string): void } {
 }
 
 export const silentLog: Logger = createLogger("silent");
+
+/** A logger that keeps every entry it writes, parsed, for assertions. */
+export function capturingLog(): { log: Logger; entries: Record<string, unknown>[] } {
+  const entries: Record<string, unknown>[] = [];
+  const log = pino(
+    { level: "debug" },
+    {
+      write: (line: string) => {
+        entries.push(JSON.parse(line) as Record<string, unknown>);
+      },
+    },
+  );
+  return { log, entries };
+}
 
 /**
  * A scripted fake: answers the planned calls in order and fails the test on any call it was

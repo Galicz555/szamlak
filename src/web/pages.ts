@@ -11,14 +11,14 @@ export interface StatusBar {
   runs: { label: string; run: RunRow | undefined }[];
   deadLettered: number;
   consentWarnings: string[];
+  /** The zone the status bar's times are shown in (TIME_ZONE). */
+  timeZone: string;
 }
 
-const formatInstant = (iso: string): string =>
-  new Intl.DateTimeFormat("hu-HU", {
-    dateStyle: "short",
-    timeStyle: "short",
-    timeZone: "Europe/Budapest",
-  }).format(new Date(iso));
+const formatInstant = (iso: string, timeZone: string): string =>
+  new Intl.DateTimeFormat("hu-HU", { dateStyle: "short", timeStyle: "short", timeZone }).format(
+    new Date(iso),
+  );
 
 function statusBar(s: StatusBar): Html {
   return html`<section class="status" aria-label="Állapot">
@@ -29,7 +29,7 @@ function statusBar(s: StatusBar): Html {
             ${label}:
             ${
               run
-                ? html`${formatInstant(run.started_at)}
+                ? html`${formatInstant(run.started_at, s.timeZone)}
                   ${run.outcome === "error" ? html` — hiba: ${run.error}` : run.outcome === null ? " — fut" : ""}`
                 : "még nem futott"
             }
@@ -209,7 +209,7 @@ export function billPage(
     </form>`;
 }
 
-export function inboxPage(items: InboundItem[]): Html {
+export function inboxPage(items: InboundItem[], timeZone: string): Html {
   if (items.length === 0) return html`<p>Nincs kézi beavatkozásra váró tétel.</p>`;
   return html`<p>
       Ezekből nem sikerült megbízhatóan kiolvasni a számlát. Nézd meg az eredetit, és próbáld újra
@@ -232,7 +232,7 @@ export function inboxPage(items: InboundItem[]): Html {
         ${items.map(
           (i) =>
             html`<tr>
-              <td>${formatInstant(i.received_at)}</td>
+              <td>${formatInstant(i.received_at, timeZone)}</td>
               <td>${i.sender}</td>
               <td><a href="/inbox/${i.id}/file">${i.subject || "(nincs tárgy)"}</a></td>
               <td>${i.last_error_code}: ${i.last_error}</td>
@@ -251,6 +251,7 @@ export function bankPage(
   accounts: AccountRow[],
   aspsps: { name: string; country: string }[] | { error: string },
   message: string | null,
+  timeZone: string,
 ): Html {
   return html` ${message ? html`<p role="status">${message}</p>` : ""}
     <h2>Összekötött számlák</h2>
@@ -275,7 +276,7 @@ export function bankPage(
                   html`<tr>
                     <td>${a.aspsp_name}</td>
                     <td>${a.name ?? ""} ${a.iban ?? ""} ${a.currency ?? ""}</td>
-                    <td>${formatInstant(a.valid_until)}</td>
+                    <td>${formatInstant(a.valid_until, timeZone)}</td>
                     <td>${a.last_booking_date ?? "—"}</td>
                   </tr>`,
               )}

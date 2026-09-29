@@ -4,12 +4,13 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
+import type { Logger } from "pino";
 import type { BankFeed } from "../src/bank/enable-banking.ts";
 import type { BillExtractor } from "../src/extract/extractors.ts";
 import type { Mailbox } from "../src/mail/mailbox.ts";
 import { Poller } from "../src/poll/poller.ts";
 import type { Clock } from "../src/shared/time.ts";
-import { fixedClock, memDb, silentLog } from "./helpers.ts";
+import { capturingLog, fixedClock, memDb, silentLog } from "./helpers.ts";
 
 const TIME_ZONE = "Europe/Budapest";
 
@@ -29,12 +30,17 @@ const unusedFeed: BankFeed = {
 function makePoller(
   db: DatabaseSync,
   clock: Clock,
-  { mailbox = emptyMailbox, backupEnabled = false } = {},
+  {
+    mailbox = emptyMailbox,
+    backupEnabled = false,
+    backupTimeZone = TIME_ZONE,
+    log = silentLog,
+  }: { mailbox?: Mailbox; backupEnabled?: boolean; backupTimeZone?: string; log?: Logger } = {},
 ): { poller: Poller; backupDir: string } {
   const dataDir = mkdtempSync(path.join(tmpdir(), "szamlak-"));
   const backupDir = mkdtempSync(path.join(tmpdir(), "szamlak-backup-"));
   const poller = new Poller(
-    { db, clock, log: silentLog, mailbox, extractor: unusedExtractor, feed: unusedFeed },
+    { db, clock, log, mailbox, extractor: unusedExtractor, feed: unusedFeed },
     {
       mail: {
         dataDir,
@@ -46,7 +52,7 @@ function makePoller(
       },
       extract: { dataDir, maxAttempts: 3 },
       bank: { timeZone: TIME_ZONE, lookbackDays: 90, pollHours: 6 },
-      backup: { enabled: backupEnabled, dataDir, backupDir, keep: 2, timeZone: TIME_ZONE },
+      backup: { enabled: backupEnabled, dataDir, backupDir, keep: 2, timeZone: backupTimeZone },
     },
   );
   return { poller, backupDir };
@@ -124,4 +130,26 @@ test("the backup runs once per calendar day in the configured time zone", async 
       .sort(),
     ["szamlak-2026-09-20.db", "szamlak-2026-09-21.db"],
   );
+});
+
+test("an error between the stages is logged and the pass still resolves", async () => {
+  const db = memDb();
+  const clock = fixedClock("2026-09-20T10:00:00Z");
+  const { log, entries } = capturingLog();
+  // The backup check reads "today" in this zone, after every stage has run, and throws.
+  const { poller } = makePoller(db, clock, {
+    backupEnabled: true,
+    backupTimeZone: "Not/A_Zone",
+    log,
+  });
+
+  await poller.trigger();
+  assert.ok(!poller.running);
+  assert.ok(entries.some((e) => e.msg === "pass failed" && typeof e.err === "string"));
+  assert.deepEqual(outcomes(db, "backup"), []);
+  assert.deepEqual(outcomes(db, "mail"), ["ok"]);
+
+  // The lock was released: the next trigger starts a new pass.
+  await poller.trigger();
+  assert.deepEqual(outcomes(db, "mail"), ["ok", "ok"]);
 });

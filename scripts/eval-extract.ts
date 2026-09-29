@@ -12,6 +12,7 @@
 import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
+import { loadExtractorEnv } from "../src/env.ts";
 import { GeminiExtractor, LocalExtractor, type BillExtractor } from "../src/extract/extractors.ts";
 import { fetchPdfText } from "../src/extract/pdf-text.ts";
 import { extractVerified } from "../src/extract/process.ts";
@@ -30,14 +31,13 @@ if (!dir) {
   process.exit(2);
 }
 
+const env = loadExtractorEnv();
 const extractors: BillExtractor[] = [];
-if (process.env.LOCAL_LLM_URL && process.env.LOCAL_LLM_MODEL) {
-  extractors.push(new LocalExtractor(process.env.LOCAL_LLM_URL, process.env.LOCAL_LLM_MODEL));
+if (env.LOCAL_LLM_URL && env.LOCAL_LLM_MODEL) {
+  extractors.push(new LocalExtractor(env.LOCAL_LLM_URL, env.LOCAL_LLM_MODEL));
 }
-if (process.env.GEMINI_API_KEY) {
-  extractors.push(
-    new GeminiExtractor(process.env.GEMINI_API_KEY, process.env.GEMINI_MODEL ?? "gemini-2.5-flash"),
-  );
+if (env.GEMINI_API_KEY) {
+  extractors.push(new GeminiExtractor(env.GEMINI_API_KEY, env.GEMINI_MODEL));
 }
 if (extractors.length === 0) {
   console.error("No extractor configured (LOCAL_LLM_URL + LOCAL_LLM_MODEL and/or GEMINI_API_KEY).");

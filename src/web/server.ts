@@ -20,6 +20,7 @@ import {
   listActiveBills,
   listDeadLetteredInboundItems,
   requeueInboundItem,
+  type InboundItem,
 } from "../bills/repo.ts";
 import { withTransaction } from "../db/db.ts";
 import { AppError, categoryOf, codeOf } from "../errors.ts";
@@ -102,12 +103,32 @@ function redirect(res: ServerResponse, location: string): void {
   res.end();
 }
 
-function sendFile(res: ServerResponse, file: string): void {
+/**
+ * Streams a stored item file. A file that is gone is a 404; any other read error is logged and
+ * answered with a 500, or, once the 200 is out, ends the response abruptly so a partial file
+ * never looks complete.
+ */
+function sendFile(d: WebDeps, res: ServerResponse, item: InboundItem): void {
+  const file = path.join(d.dataDir, item.file_path);
   const isPdf = file.endsWith(".pdf");
   const stream = createReadStream(file);
-  stream.on("error", () => {
-    if (!res.headersSent) res.writeHead(404, { "content-type": "text/plain" });
-    res.end("Not found");
+  stream.on("error", (err) => {
+    const code = "code" in err ? err.code : undefined;
+    if (!res.headersSent && code === "ENOENT") {
+      res.writeHead(404, { "content-type": "text/plain" });
+      res.end("Not found");
+      return;
+    }
+    d.log.error(
+      { itemId: item.id, filePath: item.file_path, code, err: errorText(err) },
+      "file read failed",
+    );
+    if (res.headersSent) {
+      res.destroy(err);
+      return;
+    }
+    res.writeHead(500, { "content-type": "text/plain" });
+    res.end("Could not read file");
   });
   stream.once("open", () => {
     // Hostile documents never render on our origin: PDFs download (a PDF-viewer bug would
@@ -143,6 +164,7 @@ function getStatusBar(d: WebDeps): StatusBar {
     ],
     deadLettered: listDeadLetteredInboundItems(d.db).length,
     consentWarnings,
+    timeZone: d.timeZone,
   };
 }
 
@@ -225,7 +247,7 @@ const routes: { method: string; pattern: RegExp; handler: Handler }[] = [
       const bill = getBill(d.db, parseInput(uuid, id));
       const item = bill ? getInboundItem(d.db, bill.inbound_item_id) : undefined;
       if (!item) throw new AppError("not_found", "FILE_NOT_FOUND", "No such file");
-      sendFile(res, path.join(d.dataDir, item.file_path));
+      sendFile(d, res, item);
     },
   },
   {
@@ -265,7 +287,7 @@ const routes: { method: string; pattern: RegExp; handler: Handler }[] = [
         layout(
           "Kézi beavatkozás kell",
           getStatusBar(d),
-          inboxPage(listDeadLetteredInboundItems(d.db)),
+          inboxPage(listDeadLetteredInboundItems(d.db), d.timeZone),
         ),
       );
     },
@@ -276,7 +298,7 @@ const routes: { method: string; pattern: RegExp; handler: Handler }[] = [
     handler: (d, _req, res, [id = ""]) => {
       const item = getInboundItem(d.db, parseInput(uuid, id));
       if (!item) throw new AppError("not_found", "FILE_NOT_FOUND", "No such file");
-      sendFile(res, path.join(d.dataDir, item.file_path));
+      sendFile(d, res, item);
     },
   },
   {
@@ -311,7 +333,11 @@ const routes: { method: string; pattern: RegExp; handler: Handler }[] = [
       sendHtml(
         res,
         200,
-        layout("Bankkapcsolat", getStatusBar(d), bankPage(listAccounts(d.db), aspsps, message)),
+        layout(
+          "Bankkapcsolat",
+          getStatusBar(d),
+          bankPage(listAccounts(d.db), aspsps, message, d.timeZone),
+        ),
       );
     },
   },
