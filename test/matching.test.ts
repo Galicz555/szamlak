@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
+import type { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
-import { insertTransactions, saveSession, unmatchedDebits } from "../src/bank/repo.ts";
+import { insertTransactions, saveSession, listUnmatchedDebits } from "../src/bank/repo.ts";
 import { getBill, insertBill, insertInboundItem, listActiveBills } from "../src/bills/repo.ts";
-import type { Db } from "../src/db/db.ts";
 import { candidatesFor, decide, type MatchBill, type MatchTx } from "../src/match/engine.ts";
 import { confirmMatch, revokeMatch, runAutoMatch } from "../src/match/matching.ts";
 import { fixedClock, memDb } from "./helpers.ts";
@@ -75,7 +75,7 @@ test("wrong currency, wrong amount or outside the window is not a candidate", ()
 
 // ---- against the migrated schema ------------------------------------------------------------
 
-function seed(db: Db, clock: ReturnType<typeof fixedClock>) {
+function seed(db: DatabaseSync, clock: ReturnType<typeof fixedClock>) {
   const addBill = (invoice: string, due: string, issue: string) => {
     const sha = randomUUID();
     insertInboundItem(db, clock, {
@@ -179,7 +179,7 @@ test("the database refuses a second active match on the same transaction", () =>
   const clock = fixedClock("2026-09-20T10:00:00Z");
   seed(db, clock);
   const [aug, sep] = listActiveBills(db).sort((a, b) => a.due_date.localeCompare(b.due_date));
-  const [t] = unmatchedDebits(db, "2026-01-01", "2026-12-31");
+  const [t] = listUnmatchedDebits(db, "2026-01-01", "2026-12-31");
   assert.ok(aug && sep && t);
   const insert = (billId: string) =>
     db

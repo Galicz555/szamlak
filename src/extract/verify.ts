@@ -1,6 +1,6 @@
-import { isCalendarDate } from "../shared/time.ts";
 import { minorDigitsOf, parseAmountMinor } from "../shared/money.ts";
-import type { Extraction } from "./schema.ts";
+import { isCalendarDate } from "../shared/time.ts";
+import { BILL_CURRENCIES, type BillCurrency, type Extraction } from "./schema.ts";
 
 export interface VerifiedBill {
   supplierName: string;
@@ -19,7 +19,7 @@ export type Verdict =
   | { kind: "nothing_to_pay" }
   | { kind: "rejected"; problems: string[] };
 
-const squash = (s: string): string => s.replace(/\s+/g, "").toLowerCase();
+const toCompactLower = (s: string): string => s.replace(/\s+/g, "").toLowerCase();
 
 const HU_MONTHS = [
   "január",
@@ -37,7 +37,7 @@ const HU_MONTHS = [
 ];
 
 /** Does the calendar date appear in the text in any usual Hungarian notation? */
-export function dateAppears(date: string, squashedText: string): boolean {
+export function isDateInText(date: string, compactText: string): boolean {
   const [y = "", m = "", d = ""] = date.split("-");
   const mm = [m, String(Number(m))];
   const dd = [d, String(Number(d))];
@@ -51,7 +51,7 @@ export function dateAppears(date: string, squashedText: string): boolean {
   if (month) for (const da of dd) candidates.push(`${y}.${month}${da}`);
   // Day-first forms some bills use: 15.10.2026, 15/10/2026.
   for (const mo of mm) for (const da of dd) candidates.push(`${da}.${mo}.${y}`, `${da}/${mo}/${y}`);
-  return candidates.some((c) => squashedText.includes(c));
+  return candidates.some((c) => compactText.includes(c));
 }
 
 // Only regex syntax characters: in unicode mode escaping anything else ("\\-") is an error.
@@ -65,7 +65,7 @@ const SPACE = "[ \\u00a0\\u202f]";
  * The match may not be part of a longer word or number — including a space-grouped one, so
  * "1234" is not found in "1234 5678".
  */
-export function tokenAppears(needle: string, text: string): boolean {
+export function isTokenInText(needle: string, text: string): boolean {
   const chars = Array.from(needle.replace(/\s+/g, ""));
   const first = chars[0];
   const last = chars.at(-1);
@@ -105,39 +105,37 @@ export function printedAmounts(text: string, minorDigits: number): Set<number> {
  */
 export function verifyExtraction(x: Extraction, text: string): Verdict {
   if (!x.is_bill) return { kind: "not_a_bill" };
-  const hay = squash(text);
+  const compactText = toCompactLower(text);
   const problems: string[] = [];
 
   const invoiceNumber = x.invoice_number?.trim() ?? "";
   if (!invoiceNumber) problems.push("invoice_number missing");
-  else if (!tokenAppears(invoiceNumber, text)) problems.push("invoice_number not found in text");
+  else if (!isTokenInText(invoiceNumber, text)) problems.push("invoice_number not found in text");
 
   const currency = x.currency?.toUpperCase() ?? "";
-  if (currency !== "HUF" && currency !== "EUR") problems.push("currency missing or unsupported");
+  if (!isBillCurrency(currency)) problems.push("currency missing or unsupported");
 
   let amountMinor: number | null = null;
   const amountText = x.amount_due_text?.trim() ?? "";
   if (!amountText) problems.push("amount_due_text missing");
-  else {
-    if (currency === "HUF" || currency === "EUR") {
-      const digits = minorDigitsOf(currency);
-      try {
-        amountMinor = parseAmountMinor(amountText, digits);
-        if (!printedAmounts(text, digits).has(amountMinor)) {
-          problems.push("amount_due_text not found in text");
-        }
-      } catch {
-        problems.push("amount_due_text is not an amount");
+  else if (isBillCurrency(currency)) {
+    const digits = minorDigitsOf(currency);
+    try {
+      amountMinor = parseAmountMinor(amountText, digits);
+      if (!printedAmounts(text, digits).has(amountMinor)) {
+        problems.push("amount_due_text not found in text");
       }
+    } catch {
+      problems.push("amount_due_text is not an amount");
     }
   }
 
   const dueDate = x.due_date?.trim() ?? "";
   if (!isCalendarDate(dueDate)) problems.push("due_date missing or not YYYY-MM-DD");
-  else if (!dateAppears(dueDate, hay)) problems.push("due_date not found in text");
+  else if (!isDateInText(dueDate, compactText)) problems.push("due_date not found in text");
 
   let issueDate: string | null = x.issue_date?.trim() ?? null;
-  if (issueDate && (!isCalendarDate(issueDate) || !dateAppears(issueDate, hay))) {
+  if (issueDate && (!isCalendarDate(issueDate) || !isDateInText(issueDate, compactText))) {
     // Optional field: drop it rather than reject the bill over it.
     issueDate = null;
   }
@@ -157,12 +155,16 @@ export function verifyExtraction(x: Extraction, text: string): Verdict {
       supplierName,
       invoiceNumber,
       // Optional identifiers are kept only when they are really in the text.
-      payerId: payerId && tokenAppears(payerId, text) ? payerId : null,
+      payerId: payerId && isTokenInText(payerId, text) ? payerId : null,
       amountMinor,
       currency,
       issueDate,
       dueDate,
-      iban: iban && tokenAppears(iban, text) ? iban : null,
+      iban: iban && isTokenInText(iban, text) ? iban : null,
     },
   };
+}
+
+function isBillCurrency(currency: string): currency is BillCurrency {
+  return BILL_CURRENCIES.some((c) => c === currency);
 }

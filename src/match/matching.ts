@@ -1,10 +1,20 @@
 import { randomUUID } from "node:crypto";
-import { unmatchedDebits, type TransactionRow } from "../bank/repo.ts";
-import { getBill, unmatchedBills, type BillRow } from "../bills/repo.ts";
-import { transaction, type Db } from "../db/db.ts";
+import type { DatabaseSync } from "node:sqlite";
+import { z } from "zod";
+import { listUnmatchedDebits, type TransactionRow } from "../bank/repo.ts";
+import { getBill, listUnmatchedBills, type BillRow } from "../bills/repo.ts";
+import { withTransaction } from "../db/db.ts";
+import { parseRows } from "../db/rows.ts";
 import { AppError } from "../errors.ts";
 import { instant, type Clock } from "../shared/time.ts";
-import { candidatesFor, decide, searchWindow, type Candidate, type MatchBill } from "./engine.ts";
+import {
+  candidatesFor,
+  decide,
+  searchWindow,
+  type Candidate,
+  type MatchBill,
+  type MatchTx,
+} from "./engine.ts";
 
 function toMatchBill(b: BillRow): MatchBill {
   return {
@@ -20,7 +30,7 @@ function toMatchBill(b: BillRow): MatchBill {
   };
 }
 
-const toMatchTx = (t: TransactionRow) => ({
+const toMatchTx = (t: TransactionRow): MatchTx => ({
   id: t.id,
   amountMinor: t.amount_minor,
   currency: t.currency,
@@ -30,7 +40,7 @@ const toMatchTx = (t: TransactionRow) => ({
 });
 
 function insertMatch(
-  db: Db,
+  db: DatabaseSync,
   clock: Clock,
   billId: string,
   transactionId: string,
@@ -44,11 +54,14 @@ function insertMatch(
 }
 
 /** Transactions a person has un-matched from this bill; auto-matching must not re-pick them. */
-function revokedTxIds(db: Db, billId: string): Set<string> {
-  const rows = db
-    .prepare(`SELECT transaction_id FROM bill_match WHERE bill_id = ? AND revoked_at IS NOT NULL`)
-    .all(billId);
-  return new Set(rows.map((r) => String(r.transaction_id)));
+function listRevokedTxIds(db: DatabaseSync, billId: string): Set<string> {
+  const rows = parseRows(
+    z.object({ transaction_id: z.string() }),
+    db
+      .prepare(`SELECT transaction_id FROM bill_match WHERE bill_id = ? AND revoked_at IS NOT NULL`)
+      .all(billId),
+  );
+  return new Set(rows.map((r) => r.transaction_id));
 }
 
 /**
@@ -56,14 +69,14 @@ function revokedTxIds(db: Db, billId: string): Set<string> {
  * identical Telekom fee cannot claim last month's payment. One transaction, synchronous: the
  * partial unique indexes back up the "each transaction once" rule.
  */
-export function runAutoMatch(db: Db, clock: Clock): number {
-  return transaction(db, () => {
+export function runAutoMatch(db: DatabaseSync, clock: Clock): number {
+  return withTransaction(db, () => {
     let matched = 0;
-    for (const bill of unmatchedBills(db)) {
+    for (const bill of listUnmatchedBills(db)) {
       const mb = toMatchBill(bill);
       const { from, to } = searchWindow(mb);
-      const revoked = revokedTxIds(db, bill.id);
-      const txs = unmatchedDebits(db, from, to).filter((t) => !revoked.has(t.id));
+      const revoked = listRevokedTxIds(db, bill.id);
+      const txs = listUnmatchedDebits(db, from, to).filter((t) => !revoked.has(t.id));
       const decision = decide(candidatesFor(mb, txs.map(toMatchTx)));
       if (decision.kind !== "auto") continue;
       insertMatch(
@@ -81,18 +94,23 @@ export function runAutoMatch(db: Db, clock: Clock): number {
 }
 
 /** Candidates for one bill, for the detail page. */
-export function suggestionsFor(db: Db, billId: string): Candidate[] {
+export function listCandidates(db: DatabaseSync, billId: string): Candidate[] {
   const bill = getBill(db, billId);
   if (!bill) return [];
   const mb = toMatchBill(bill);
   const { from, to } = searchWindow(mb);
-  return candidatesFor(mb, unmatchedDebits(db, from, to).map(toMatchTx));
+  return candidatesFor(mb, listUnmatchedDebits(db, from, to).map(toMatchTx));
 }
 
 /** A person confirms a suggestion. Only a current candidate can be confirmed. */
-export function confirmMatch(db: Db, clock: Clock, billId: string, transactionId: string): void {
-  transaction(db, () => {
-    const candidate = suggestionsFor(db, billId).find((c) => c.transactionId === transactionId);
+export function confirmMatch(
+  db: DatabaseSync,
+  clock: Clock,
+  billId: string,
+  transactionId: string,
+): void {
+  withTransaction(db, () => {
+    const candidate = listCandidates(db, billId).find((c) => c.transactionId === transactionId);
     if (!candidate) {
       throw new AppError(
         "conflict",
@@ -109,7 +127,7 @@ export function confirmMatch(db: Db, clock: Clock, billId: string, transactionId
 }
 
 /** Revoking keeps the row as history, and that history stops auto-matching from re-picking the pair. */
-export function revokeMatch(db: Db, clock: Clock, billId: string): boolean {
+export function revokeMatch(db: DatabaseSync, clock: Clock, billId: string): boolean {
   return (
     db
       .prepare(`UPDATE bill_match SET revoked_at = ? WHERE bill_id = ? AND revoked_at IS NULL`)

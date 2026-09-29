@@ -1,17 +1,22 @@
-import { insertTransactions, listAccounts } from "./repo.ts";
-import type { Db } from "../db/db.ts";
+import type { DatabaseSync } from "node:sqlite";
+import type { Logger } from "pino";
+import { withTransaction } from "../db/db.ts";
 import { AppError } from "../errors.ts";
-import { errorText, type Logger } from "../log.ts";
+import { errorText } from "../log.ts";
 import { addDays, instant, todayIn, type Clock } from "../shared/time.ts";
 import type { BankFeed } from "./enable-banking.ts";
-import { transaction } from "../db/db.ts";
+import { insertTransactions, listAccounts } from "./repo.ts";
 
 export interface BankSyncDeps {
-  db: Db;
+  db: DatabaseSync;
   clock: Clock;
   log: Logger;
   feed: BankFeed;
+}
+
+export interface BankSyncSettings {
   timeZone: string;
+  /** How far back the first fetch after a new consent reaches. */
   lookbackDays: number;
 }
 
@@ -23,9 +28,11 @@ const OVERLAP_DAYS = 7;
  * failure makes the run an error so the status bar shows it, but never removes or changes
  * what is already stored ("bank unknown" is not "not paid").
  */
-export async function syncBank(deps: BankSyncDeps): Promise<{ inserted: number }> {
-  const { db, clock, log } = deps;
-  const today = todayIn(clock, deps.timeZone);
+export async function syncBank(
+  { db, clock, log, feed }: BankSyncDeps,
+  settings: BankSyncSettings,
+): Promise<{ inserted: number }> {
+  const today = todayIn(clock, settings.timeZone);
   const now = instant(clock);
   const failures: string[] = [];
   let inserted = 0;
@@ -37,12 +44,14 @@ export async function syncBank(deps: BankSyncDeps): Promise<{ inserted: number }
     }
     const from = account.last_booking_date
       ? addDays(account.last_booking_date, -OVERLAP_DAYS)
-      : addDays(today, -deps.lookbackDays);
+      : addDays(today, -settings.lookbackDays);
     try {
-      const txs = await deps.feed.bookedTransactions(account.provider_uid, from, today);
-      inserted += transaction(db, () => insertTransactions(db, clock, account.id, txs));
+      const txs = await feed.bookedTransactions(account.provider_uid, from, today);
+      inserted += withTransaction(db, () => insertTransactions(db, clock, account.id, txs));
     } catch (err: unknown) {
-      failures.push(`${account.aspsp_name} ${account.name ?? ""}: ${errorText(err, 200)}`);
+      failures.push(
+        `${account.aspsp_name} ${account.name ?? ""}: ${errorText(err, { maxChars: 200 })}`,
+      );
       log.warn({ account: account.id, err: errorText(err) }, "bank sync failed for account");
     }
   }

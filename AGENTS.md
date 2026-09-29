@@ -14,6 +14,8 @@ pnpm eval:extract samples/   # local vs Gemini extraction quality gate
 pnpm backup:verify    # restore drill on the newest snapshot
 ```
 
+Code style: `docs/code-style.md`.
+
 Node 26 runs the `.ts` files directly (type stripping): only erasable syntax — no `enum`,
 no `namespace`, no parameter properties. Relative imports carry the `.ts` extension.
 
@@ -22,7 +24,7 @@ no `namespace`, no parameter properties. Relative imports carry the `.ts` extens
 | Path           | What                                                                                                                 |
 | -------------- | -------------------------------------------------------------------------------------------------------------------- |
 | `src/env.ts`   | The only reader of `process.env`; Zod-validated, no secret fallbacks                                                 |
-| `src/db/`      | `openDb`, `migrate` (SQL files in `migrations/`, `PRAGMA user_version`), sync `transaction()`, Zod row parsing       |
+| `src/db/`      | `openDb`, `migrate` (SQL files in `migrations/`, `PRAGMA user_version`), sync `withTransaction()`, Zod row parsing   |
 | `src/mail/`    | `Mailbox` port + IMAP adapter, sender authentication, ingest into `inbound_item`                                     |
 | `src/extract/` | `BillExtractor` port (local OpenAI-compatible, Gemini), `pdftotext`, verification against the text, queue processing |
 | `src/bank/`    | `BankFeed` port + Enable Banking client (RS256 JWT), repo, sync                                                      |
@@ -30,7 +32,7 @@ no `namespace`, no parameter properties. Relative imports carry the `.ts` extens
 | `src/bills/`   | Bill repo and the derived state                                                                                      |
 | `src/poll/`    | `Poller` (the background work card is in its header), run records, backup                                            |
 | `src/web/`     | `node:http` server, the Host/Origin guard, auto-escaping `html` template, pages                                      |
-| `docs/`        | `assumptions.md` (deviations, thresholds, trust boundaries, secrets), `glossary.md`                                  |
+| `docs/`        | `assumptions.md` (deviations, thresholds, trust boundaries, secrets), `glossary.md`, `code-style.md`                 |
 
 ## Rules that are easy to break
 
@@ -39,7 +41,7 @@ no `namespace`, no parameter properties. Relative imports carry the `.ts` extens
 - Money is integer minor units + currency. Printed amounts → `parseAmountMinor`; API decimals →
   `parseDecimalMinor`. Never `parseFloat`.
 - Dates are `YYYY-MM-DD` calendar days; "today" comes from `todayIn(clock, TIME_ZONE)`.
-- `transaction(db, fn)` callbacks are synchronous. Never `await` inside one, and never hold one
+- `withTransaction(db, fn)` callbacks are synchronous. Never `await` inside one, and never hold one
   across a network call.
 - Paid/awaiting/overdue is derived (`bills/status.ts`), never stored.
 - Anything from a mail, a PDF or the bank reaches HTML only through the `html` template.

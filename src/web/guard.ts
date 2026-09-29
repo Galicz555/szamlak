@@ -1,7 +1,8 @@
 import type { IncomingHttpHeaders } from "node:http";
 
 /**
- * The one gate every request passes (guide A§4.2, reduced for a loopback-only single user).
+ * The one gate every request passes, reduced for a loopback-only single user (the deviation is
+ * recorded in docs/assumptions.md).
  * Loopback is not a boundary against the browser: any open tab can send requests here.
  * - Host allow-list stops DNS rebinding (evil.com resolving to 127.0.0.1).
  * - Origin check on every state-changing request stops cross-site form posts (CSRF).
@@ -37,3 +38,14 @@ export const HTML_SECURITY_HEADERS: Readonly<Record<string, string>> = {
   "referrer-policy": "no-referrer",
   "cache-control": "no-store",
 };
+
+// The consent flow always starts on Enable Banking's own pages; anything else is refused.
+const BANK_LOGIN_HOST = "enablebanking.com";
+
+/** Is this an https address on Enable Banking's own domain (or a subdomain of it)? */
+export function isBankLoginUrl(url: string): boolean {
+  const host = new URL(url).hostname;
+  return (
+    url.startsWith("https://") && (host === BANK_LOGIN_HOST || host.endsWith(`.${BANK_LOGIN_HOST}`))
+  );
+}

@@ -2,8 +2,9 @@ import assert from "node:assert/strict";
 import { generateKeyPairSync, verify } from "node:crypto";
 import { test } from "node:test";
 import { signJwt, toTransactions } from "../src/bank/enable-banking.ts";
-import { senderAuthenticated } from "../src/mail/sender-auth.ts";
-import { guardRequest } from "../src/web/guard.ts";
+import { errorText } from "../src/log.ts";
+import { isAddressedToUs, isSenderAuthenticated } from "../src/mail/sender-auth.ts";
+import { guardRequest, isBankLoginUrl } from "../src/web/guard.ts";
 import { escapeHtml, html } from "../src/web/html.ts";
 
 // ---- sender authentication -----------------------------------------------------------------
@@ -19,14 +20,14 @@ test("a DKIM pass for the From domain, written by our provider on top, is truste
       "mx.google.com;\r\n       dkim=pass header.i=@mvm.hu header.s=s1 header.b=abc;\r\n       spf=pass smtp.mailfrom=mvm.hu",
     ),
   ];
-  assert.ok(senderAuthenticated(lines, "mvm.hu", "mx.google.com"));
-  assert.ok(senderAuthenticated(lines, "szamla.mvm.hu", "mx.google.com"));
+  assert.ok(isSenderAuthenticated(lines, "mvm.hu", "mx.google.com"));
+  assert.ok(isSenderAuthenticated(lines, "szamla.mvm.hu", "mx.google.com"));
 });
 
 test("a DMARC pass counts only for the same From domain", () => {
   const lines = [ar("mx.google.com; dmarc=pass (p=REJECT) header.from=telekom.hu")];
-  assert.ok(senderAuthenticated(lines, "telekom.hu", "mx.google.com"));
-  assert.ok(!senderAuthenticated(lines, "mvm.hu", "mx.google.com"));
+  assert.ok(isSenderAuthenticated(lines, "telekom.hu", "mx.google.com"));
+  assert.ok(!isSenderAuthenticated(lines, "mvm.hu", "mx.google.com"));
 });
 
 test("a verdict the sender wrote below ours, or another server's verdict, is not trusted", () => {
@@ -34,23 +35,23 @@ test("a verdict the sender wrote below ours, or another server's verdict, is not
     ar("mx.google.com; dkim=fail header.d=mvm.hu; dmarc=fail header.from=mvm.hu"),
     ar("mx.google.com; dkim=pass header.d=mvm.hu"),
   ];
-  assert.ok(!senderAuthenticated(forgedBelow, "mvm.hu", "mx.google.com"));
+  assert.ok(!isSenderAuthenticated(forgedBelow, "mvm.hu", "mx.google.com"));
   assert.ok(
-    !senderAuthenticated(
+    !isSenderAuthenticated(
       [ar("evil.example; dkim=pass header.d=mvm.hu")],
       "mvm.hu",
       "mx.google.com",
     ),
   );
-  assert.ok(!senderAuthenticated([], "mvm.hu", "mx.google.com"));
+  assert.ok(!isSenderAuthenticated([], "mvm.hu", "mx.google.com"));
 });
 
 test("a signature by a bare TLD or another domain does not align", () => {
   assert.ok(
-    !senderAuthenticated([ar("mx.google.com; dkim=pass header.d=hu")], "mvm.hu", "mx.google.com"),
+    !isSenderAuthenticated([ar("mx.google.com; dkim=pass header.d=hu")], "mvm.hu", "mx.google.com"),
   );
   assert.ok(
-    !senderAuthenticated(
+    !isSenderAuthenticated(
       [ar("mx.google.com; dkim=pass header.d=mailer.example")],
       "mvm.hu",
       "mx.google.com",
@@ -64,14 +65,13 @@ test("pass verdicts smuggled inside a comment or a quoted envelope sender are ig
       'mx.google.com; spf=softfail (google.com: domain of "x;dkim=pass header.i=@mvm.hu "@evil.example does not designate 1.2.3.4) smtp.mailfrom="x;dmarc=pass header.from=mvm.hu "@evil.example; dkim=none; dmarc=fail header.from=mvm.hu',
     ),
   ];
-  assert.ok(!senderAuthenticated(injected, "mvm.hu", "mx.google.com"));
+  assert.ok(!isSenderAuthenticated(injected, "mvm.hu", "mx.google.com"));
 });
 
-test("addressedToUs matches our addresses, Gmail dots and +tags included", async () => {
-  const { addressedToUs } = await import("../src/mail/sender-auth.ts");
-  assert.ok(addressedToUs(["Your.Name+bills@gmail.com"], ["yourname@gmail.com"]));
-  assert.ok(!addressedToUs(["someone@gmail.com"], ["yourname@gmail.com"]));
-  assert.ok(!addressedToUs([], ["yourname@gmail.com"]));
+test("mail to our Gmail address counts as ours through dots and +tags, mail to others does not", () => {
+  assert.ok(isAddressedToUs(["Your.Name+bills@gmail.com"], ["yourname@gmail.com"]));
+  assert.ok(!isAddressedToUs(["someone@gmail.com"], ["yourname@gmail.com"]));
+  assert.ok(!isAddressedToUs([], ["yourname@gmail.com"]));
 });
 
 // ---- request guard -------------------------------------------------------------------------
@@ -91,6 +91,14 @@ test("state-changing requests need our Origin, and fail closed without one (CSRF
   assert.ok(!post({}));
   assert.ok(post({ "sec-fetch-site": "same-origin" }));
   assert.ok(!post({ "sec-fetch-site": "cross-site" }));
+});
+
+test("the bank login may start only on an https Enable Banking address", () => {
+  assert.ok(isBankLoginUrl("https://tilisy.enablebanking.com/welcome?x=1"));
+  assert.ok(isBankLoginUrl("https://enablebanking.com/login"));
+  assert.ok(!isBankLoginUrl("http://tilisy.enablebanking.com/welcome"));
+  assert.ok(!isBankLoginUrl("https://enablebanking.com.evil.example/login"));
+  assert.ok(!isBankLoginUrl("https://evilenablebanking.com/login"));
 });
 
 // ---- html escaping -------------------------------------------------------------------------
@@ -154,6 +162,28 @@ test("transactions map direction and amount exactly; pending ones are skipped", 
   ]);
 });
 
+test("without a debit/credit indicator the sign decides the direction; amounts stay positive", () => {
+  const booked = { status: "BOOK", booking_date: "2026-09-12" };
+  const txs = toTransactions([
+    { ...booked, entry_reference: "A", transaction_amount: { amount: "-1200", currency: "HUF" } },
+    { ...booked, entry_reference: "B", transaction_amount: { amount: "1200", currency: "HUF" } },
+    {
+      ...booked,
+      entry_reference: "C",
+      transaction_amount: { amount: "1200", currency: "HUF" },
+      credit_debit_indicator: "CRDT",
+    },
+  ]);
+  assert.deepEqual(
+    txs.map((t) => [t.providerTxKey, t.direction, t.amountMinor]),
+    [
+      ["A", "debit", 120_000],
+      ["B", "credit", 120_000],
+      ["C", "credit", 120_000],
+    ],
+  );
+});
+
 test("two identical entries without a bank reference stay two rows", () => {
   const coffee = {
     transaction_amount: { amount: "-1200", currency: "HUF" },
@@ -170,8 +200,7 @@ test("two identical entries without a bank reference stay two rows", () => {
   );
 });
 
-test("error text carries the cause chain, bounded", async () => {
-  const { errorText } = await import("../src/log.ts");
+test("error text carries the cause chain, bounded", () => {
   const err = new Error("IMAP connect failed", {
     cause: new Error("connect ECONNREFUSED 127.0.0.1:1"),
   });
@@ -179,5 +208,5 @@ test("error text carries the cause chain, bounded", async () => {
     errorText(err),
     "Error: IMAP connect failed ← Error: connect ECONNREFUSED 127.0.0.1:1",
   );
-  assert.equal(errorText(new Error("x".repeat(50)), 20).length, 21);
+  assert.equal(errorText(new Error("x".repeat(50)), { maxChars: 20 }).length, 21);
 });

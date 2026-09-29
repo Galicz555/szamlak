@@ -7,6 +7,9 @@
  */
 export type ErrorCategory = "transient" | "invalid" | "not_found" | "conflict" | "reauth";
 
+// Provider error bodies can be large; this much is enough to recognise the error.
+export const MAX_ERROR_BODY_CHARS = 300;
+
 export class AppError extends Error {
   readonly category: ErrorCategory;
   readonly code: string;

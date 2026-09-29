@@ -12,36 +12,46 @@ export interface FetchResult {
   messages: RawMessage[];
 }
 
+/** Last processed UID, valid only under `uidValidity`. */
+export interface MailCursor {
+  uidValidity: string;
+  lastUid: number;
+}
+
+export interface FetchRequest {
+  senders: string[];
+  since: Date;
+  cursor: MailCursor | null;
+}
+
 /** Read-only view of one mailbox. Never sets flags, moves or deletes. */
 export interface Mailbox {
-  fetchNew(opts: {
-    senders: string[];
-    since: Date;
-    /** Last processed UID, valid only under `uidValidity`. */
-    cursor: { uidValidity: string; lastUid: number } | null;
-  }): Promise<FetchResult>;
+  fetchNew(request: FetchRequest): Promise<FetchResult>;
+}
+
+export interface ImapSettings {
+  host: string;
+  port: number;
+  user: string;
+  password: string;
 }
 
 // Larger messages are not bills; skipping them bounds memory per tick.
 const MAX_MESSAGE_BYTES = 25 * 1024 * 1024;
 
 export class ImapMailbox implements Mailbox {
-  private readonly opts: { host: string; port: number; user: string; password: string };
+  private readonly settings: ImapSettings;
 
-  constructor(opts: { host: string; port: number; user: string; password: string }) {
-    this.opts = opts;
+  constructor(settings: ImapSettings) {
+    this.settings = settings;
   }
 
-  async fetchNew(opts: {
-    senders: string[];
-    since: Date;
-    cursor: { uidValidity: string; lastUid: number } | null;
-  }): Promise<FetchResult> {
+  async fetchNew(request: FetchRequest): Promise<FetchResult> {
     const client = new ImapFlow({
-      host: this.opts.host,
-      port: this.opts.port,
+      host: this.settings.host,
+      port: this.settings.port,
       secure: true,
-      auth: { user: this.opts.user, pass: this.opts.password },
+      auth: { user: this.settings.user, pass: this.settings.password },
       logger: false,
     });
     try {
@@ -65,12 +75,14 @@ export class ImapMailbox implements Mailbox {
         if (!opened) throw new AppError("transient", "MAIL_NO_MAILBOX", "Mailbox did not open");
         const uidValidity = opened.uidValidity.toString();
         const after =
-          opts.cursor && opts.cursor.uidValidity === uidValidity ? opts.cursor.lastUid : null;
+          request.cursor && request.cursor.uidValidity === uidValidity
+            ? request.cursor.lastUid
+            : null;
 
         const found = await client.search(
           {
-            or: opts.senders.map((s) => ({ from: s })),
-            ...(after === null ? { since: opts.since } : { uid: `${after + 1}:*` }),
+            or: request.senders.map((s) => ({ from: s })),
+            ...(after === null ? { since: request.since } : { uid: `${after + 1}:*` }),
           },
           { uid: true },
         );
@@ -93,6 +105,7 @@ export class ImapMailbox implements Mailbox {
         lock.release();
       }
     } finally {
+      // The result is already complete; a failed LOGOUT only leaves a socket the server closes.
       await client.logout().catch(() => undefined);
     }
   }

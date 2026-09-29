@@ -2,7 +2,7 @@ import { mkdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { EnableBankingClient, loadPrivateKey } from "./bank/enable-banking.ts";
 import { migrate, openDb } from "./db/db.ts";
-import { loadEnv } from "./env.ts";
+import { loadEnv, type Env } from "./env.ts";
 import { GeminiExtractor, LocalExtractor, type BillExtractor } from "./extract/extractors.ts";
 import { createLogger, errorText } from "./log.ts";
 import { ImapMailbox } from "./mail/mailbox.ts";
@@ -24,10 +24,7 @@ function main(): void {
   const key = loadPrivateKey(readFileSync(env.EB_PRIVATE_KEY_PATH, "utf8"));
   new Intl.DateTimeFormat("en-CA", { timeZone: env.TIME_ZONE }); // throws on an unknown zone
 
-  const extractor: BillExtractor =
-    env.EXTRACTOR === "local"
-      ? new LocalExtractor(env.LOCAL_LLM_URL ?? "", env.LOCAL_LLM_MODEL ?? "")
-      : new GeminiExtractor(env.GEMINI_API_KEY ?? "", env.GEMINI_MODEL);
+  const extractor = createExtractor(env);
 
   const feed = new EnableBankingClient({
     baseUrl: env.EB_API_URL,
@@ -36,31 +33,38 @@ function main(): void {
     nowSeconds: () => Math.floor(clock.now().getTime() / 1000),
   });
 
-  const poller = new Poller({
-    db,
-    clock,
-    log,
-    mailbox: new ImapMailbox({
-      host: env.IMAP_HOST,
-      port: env.IMAP_PORT,
-      user: env.IMAP_USER,
-      password: env.IMAP_PASSWORD,
-    }),
-    extractor,
-    feed,
-    dataDir: env.DATA_DIR,
-    backupDir: env.BACKUP_DIR,
-    timeZone: env.TIME_ZONE,
-    senders: env.MAIL_SENDERS,
-    trustedAuthserv: env.MAIL_TRUSTED_AUTHSERV,
-    recipients: env.MAIL_RECIPIENTS,
-    mailLookbackDays: env.MAIL_LOOKBACK_DAYS,
-    bankLookbackDays: env.BANK_LOOKBACK_DAYS,
-    bankPollHours: env.BANK_POLL_HOURS,
-    extractMaxAttempts: env.EXTRACT_MAX_ATTEMPTS,
-    backupEnabled: env.BACKUP_ENABLED,
-    backupKeep: env.BACKUP_KEEP,
+  const mailbox = new ImapMailbox({
+    host: env.IMAP_HOST,
+    port: env.IMAP_PORT,
+    user: env.IMAP_USER,
+    password: env.IMAP_PASSWORD,
   });
+  const poller = new Poller(
+    { db, clock, log, mailbox, extractor, feed },
+    {
+      mail: {
+        dataDir: env.DATA_DIR,
+        timeZone: env.TIME_ZONE,
+        senders: env.MAIL_SENDERS,
+        lookbackDays: env.MAIL_LOOKBACK_DAYS,
+        trustedAuthserv: env.MAIL_TRUSTED_AUTHSERV,
+        recipients: env.MAIL_RECIPIENTS,
+      },
+      extract: { dataDir: env.DATA_DIR, maxAttempts: env.EXTRACT_MAX_ATTEMPTS },
+      bank: {
+        timeZone: env.TIME_ZONE,
+        lookbackDays: env.BANK_LOOKBACK_DAYS,
+        pollHours: env.BANK_POLL_HOURS,
+      },
+      backup: {
+        enabled: env.BACKUP_ENABLED,
+        dataDir: env.DATA_DIR,
+        backupDir: env.BACKUP_DIR,
+        keep: env.BACKUP_KEEP,
+        timeZone: env.TIME_ZONE,
+      },
+    },
+  );
 
   const server = createWebServer({
     db,
@@ -74,7 +78,7 @@ function main(): void {
     redirectUrl: env.EB_REDIRECT_URL,
   });
 
-  // nova: the scheduler lives in the web process (guide A§1.2 deviation, docs/assumptions.md);
+  // nova: the scheduler lives in the web process (a deviation recorded in docs/assumptions.md);
   // move it to a worker process when a second process exists.
   const timer = setInterval(() => void poller.trigger(), env.MAIL_POLL_MINUTES * 60_000);
 
@@ -114,9 +118,18 @@ function main(): void {
   });
 }
 
+function createExtractor(env: Env): BillExtractor {
+  switch (env.EXTRACTOR) {
+    case "local":
+      return new LocalExtractor(env.LOCAL_LLM_URL ?? "", env.LOCAL_LLM_MODEL ?? "");
+    case "gemini":
+      return new GeminiExtractor(env.GEMINI_API_KEY ?? "", env.GEMINI_MODEL);
+  }
+}
+
 try {
   main();
 } catch (err: unknown) {
-  process.stderr.write(`Startup failed: ${errorText(err, 4000)}\n`);
+  process.stderr.write(`Startup failed: ${errorText(err, { maxChars: 4000 })}\n`);
   process.exit(1);
 }

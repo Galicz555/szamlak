@@ -13,7 +13,7 @@ import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
 import { GeminiExtractor, LocalExtractor, type BillExtractor } from "../src/extract/extractors.ts";
-import { pdfText } from "../src/extract/pdf-text.ts";
+import { fetchPdfText } from "../src/extract/pdf-text.ts";
 import { extractVerified } from "../src/extract/process.ts";
 
 const expectedSchema = z.object({
@@ -65,7 +65,7 @@ for (const extractor of extractors) {
     scored++;
     const e = expected.data;
     try {
-      const { verdict } = await extractVerified(extractor, await pdfText(path.join(dir, pdf)));
+      const { verdict } = await extractVerified(extractor, await fetchPdfText(path.join(dir, pdf)));
       if (verdict.kind !== "bill") {
         console.log(
           `  ${pdf}: not accepted (${verdict.kind}${verdict.kind === "rejected" ? `: ${verdict.problems.join("; ")}` : ""})`,

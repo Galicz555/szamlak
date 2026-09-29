@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { AppError, categoryForHttpStatus } from "../errors.ts";
+import { AppError, categoryForHttpStatus, MAX_ERROR_BODY_CHARS } from "../errors.ts";
 import { EXTRACTION_PROMPT, extractionGeminiSchema, extractionJsonSchema } from "./schema.ts";
 
 /** Turns bill text into the extraction JSON. Returns the raw parsed JSON; the caller validates it. */
@@ -11,7 +11,12 @@ export interface BillExtractor {
 // Bills are 1–4 pages; this keeps the prompt well inside a 16k-token context.
 export const MAX_TEXT_CHARS = 20_000;
 
-function userMessage(text: string, feedback?: string): string {
+const LOCAL_LLM_TIMEOUT_MS = 180_000;
+const GEMINI_TIMEOUT_MS = 120_000;
+// The answer is one small JSON object; the cap ends a generation that does not stop.
+const LOCAL_LLM_MAX_TOKENS = 800;
+
+function toUserMessage(text: string, feedback?: string): string {
   const body = text.length > MAX_TEXT_CHARS ? text.slice(0, MAX_TEXT_CHARS) : text;
   return feedback
     ? `${body}\n\n---\nYour previous answer failed these checks against the text: ${feedback}\nRead the text again and correct those fields.`
@@ -38,12 +43,11 @@ async function postJson(
   }
   const text = await res.text();
   if (!res.ok) {
+    const category = categoryForHttpStatus(res.status);
     throw new AppError(
-      categoryForHttpStatus(res.status) === "reauth"
-        ? "invalid"
-        : categoryForHttpStatus(res.status),
+      category === "reauth" ? "invalid" : category,
       `EXTRACTOR_HTTP_${res.status}`,
-      `${what} → ${res.status}: ${text.slice(0, 300)}`,
+      `${what} → ${res.status}: ${text.slice(0, MAX_ERROR_BODY_CHARS)}`,
     );
   }
   try {
@@ -88,10 +92,10 @@ export class LocalExtractor implements BillExtractor {
       {
         model: this.model,
         temperature: 0,
-        max_tokens: 800,
+        max_tokens: LOCAL_LLM_MAX_TOKENS,
         messages: [
           { role: "system", content: EXTRACTION_PROMPT },
-          { role: "user", content: userMessage(text, feedback) },
+          { role: "user", content: toUserMessage(text, feedback) },
         ],
         response_format: {
           type: "json_schema",
@@ -100,7 +104,7 @@ export class LocalExtractor implements BillExtractor {
         // Qwen3-family servers: no chain-of-thought before the JSON.
         chat_template_kwargs: { enable_thinking: false },
       },
-      180_000,
+      LOCAL_LLM_TIMEOUT_MS,
       "Local LLM",
     );
     const parsed = chatResponse.safeParse(raw);
@@ -142,14 +146,14 @@ export class GeminiExtractor implements BillExtractor {
       url,
       {
         systemInstruction: { parts: [{ text: EXTRACTION_PROMPT }] },
-        contents: [{ role: "user", parts: [{ text: userMessage(text, feedback) }] }],
+        contents: [{ role: "user", parts: [{ text: toUserMessage(text, feedback) }] }],
         generationConfig: {
           temperature: 0,
           responseMimeType: "application/json",
           responseSchema: extractionGeminiSchema,
         },
       },
-      120_000,
+      GEMINI_TIMEOUT_MS,
       "Gemini",
       { "x-goog-api-key": this.apiKey },
     );

@@ -59,7 +59,7 @@ function propertyDomain(
  * Passing means DMARC passed for the From domain, or a DKIM signature of the From domain (or a
  * parent of it) verified. A forged "MVM bill" with someone else's IBAN must not become a bill.
  */
-export function senderAuthenticated(
+export function isSenderAuthenticated(
   headerLines: readonly { key: string; line: string }[],
   fromDomain: string,
   trustedAuthserv: string,
@@ -76,7 +76,7 @@ export function senderAuthenticated(
   if (authserv.split(/\s+/)[0] !== trustedAuthserv.toLowerCase()) return false;
 
   const domain = fromDomain.toLowerCase();
-  const alignedWith = (d: string | undefined): boolean =>
+  const isAlignedWith = (d: string | undefined): boolean =>
     d !== undefined &&
     d.includes(".") &&
     (d === domain || domain.endsWith(`.${d}`) || d.endsWith(`.${domain}`));
@@ -85,7 +85,7 @@ export function senderAuthenticated(
     if (/^dmarc=pass(\s|$)/.test(r) && propertyDomain(r, "header.from") === domain) return true;
     if (
       /^dkim=pass(\s|$)/.test(r) &&
-      (alignedWith(propertyDomain(r, "header.d")) || alignedWith(propertyDomain(r, "header.i")))
+      (isAlignedWith(propertyDomain(r, "header.d")) || isAlignedWith(propertyDomain(r, "header.i")))
     ) {
       return true;
     }
@@ -105,7 +105,7 @@ const normalizeAddress = (address: string): string => {
  * Was the message addressed to us? A genuine, DKIM-signed bill another MVM customer received
  * and re-sent to us still passes sender authentication; its To/Cc (which DKIM signs) names them.
  */
-export function addressedToUs(recipients: readonly string[], ours: readonly string[]): boolean {
+export function isAddressedToUs(recipients: readonly string[], ours: readonly string[]): boolean {
   const mine = new Set(ours.map(normalizeAddress));
   return recipients.some((r) => mine.has(normalizeAddress(r)));
 }

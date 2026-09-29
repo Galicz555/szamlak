@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { Extraction } from "../src/extract/schema.ts";
-import { verifyExtraction } from "../src/extract/verify.ts";
+import { printedAmounts, verifyExtraction } from "../src/extract/verify.ts";
 
 const TEXT = `MVM Next Energiakereskedelmi Zrt.
 Számla sorszáma: 5 1234 5678 90
@@ -99,8 +99,7 @@ test("a fragment of a space-grouped amount, or digits joined across columns, is 
   }
 });
 
-test("printed amounts: grouped, decimal, suffixed; never date or id fragments", async () => {
-  const { printedAmounts } = await import("../src/extract/verify.ts");
+test("printed amounts: grouped, decimal, suffixed; never date or id fragments", () => {
   const found = printedAmounts(
     "Összesen: 1 234 567 Ft, díj 12.345,- és 99,50 EUR; 12345Ft. Kelt 2026.09.18. Szám E-SZ-2026/0045871",
     2,

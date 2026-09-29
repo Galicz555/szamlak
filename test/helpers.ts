@@ -1,9 +1,11 @@
-import { migrate, openDb, type Db } from "../src/db/db.ts";
-import { createLogger, type Logger } from "../src/log.ts";
+import type { DatabaseSync } from "node:sqlite";
+import type { Logger } from "pino";
+import { migrate, openDb } from "../src/db/db.ts";
+import { createLogger } from "../src/log.ts";
 import type { Clock } from "../src/shared/time.ts";
 
 /** A fresh database built by the same migration chain production runs. */
-export function memDb(): Db {
+export function memDb(): DatabaseSync {
   const db = openDb(":memory:");
   migrate(db);
   return db;
@@ -23,7 +25,7 @@ export const silentLog: Logger = createLogger("silent");
 
 /**
  * A scripted fake: answers the planned calls in order and fails the test on any call it was
- * not told to expect (guide C§10.2).
+ * not told to expect.
  */
 export function scripted<T>(
   name: string,

@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
+import type { DatabaseSync } from "node:sqlite";
 import { z } from "zod";
-import type { Db } from "../db/db.ts";
-import { all, one } from "../db/rows.ts";
+import { parseRow, parseRows } from "../db/rows.ts";
+import type { VerifiedBill } from "../extract/verify.ts";
 import { instant, type Clock } from "../shared/time.ts";
 
 // ---- inbound items -------------------------------------------------------------------------
@@ -20,7 +21,7 @@ export interface NewInboundItem {
 }
 
 /** Idempotent on the content hash: the same PDF from two messages or two runs is one item. */
-export function insertInboundItem(db: Db, clock: Clock, item: NewInboundItem): boolean {
+export function insertInboundItem(db: DatabaseSync, clock: Clock, item: NewInboundItem): boolean {
   const now = instant(clock);
   const res = db
     .prepare(
@@ -66,8 +67,8 @@ export type InboundItem = z.infer<typeof inboundItemRow>;
 const INBOUND_COLS = `id, kind, sender, sender_domain, subject, received_at, file_path, status,
   attempt_count, last_error_code, last_error, result_code`;
 
-export function queuedInboundItems(db: Db): InboundItem[] {
-  return all(
+export function listQueuedInboundItems(db: DatabaseSync): InboundItem[] {
+  return parseRows(
     inboundItemRow,
     db
       .prepare(
@@ -77,8 +78,8 @@ export function queuedInboundItems(db: Db): InboundItem[] {
   );
 }
 
-export function deadLetteredItems(db: Db): InboundItem[] {
-  return all(
+export function listDeadLetteredInboundItems(db: DatabaseSync): InboundItem[] {
+  return parseRows(
     inboundItemRow,
     db
       .prepare(
@@ -89,8 +90,8 @@ export function deadLetteredItems(db: Db): InboundItem[] {
   );
 }
 
-export function getInboundItem(db: Db, id: string): InboundItem | undefined {
-  return one(
+export function getInboundItem(db: DatabaseSync, id: string): InboundItem | undefined {
+  return parseRow(
     inboundItemRow,
     db.prepare(`SELECT ${INBOUND_COLS} FROM inbound_item WHERE id = ?`).get(id),
   );
@@ -98,7 +99,12 @@ export function getInboundItem(db: Db, id: string): InboundItem | undefined {
 
 export type ResultCode = "bill_created" | "duplicate_bill" | "not_a_bill" | "nothing_to_pay";
 
-export function markInboundProcessed(db: Db, clock: Clock, id: string, result: ResultCode): void {
+export function markInboundProcessed(
+  db: DatabaseSync,
+  clock: Clock,
+  id: string,
+  result: ResultCode,
+): void {
   db.prepare(
     `UPDATE inbound_item SET status = 'processed', result_code = ?, last_error_code = NULL,
        last_error = NULL, updated_at = ? WHERE id = ?`,
@@ -110,7 +116,7 @@ export function markInboundProcessed(db: Db, clock: Clock, id: string, result: R
  * A transient failure stays queued for the next tick.
  */
 export function markInboundFailed(
-  db: Db,
+  db: DatabaseSync,
   clock: Clock,
   id: string,
   failure: { code: string; message: string; deadLetter: boolean },
@@ -122,7 +128,7 @@ export function markInboundFailed(
 }
 
 /** A person asked for another try (e.g. after switching extractor). */
-export function requeueInboundItem(db: Db, clock: Clock, id: string): boolean {
+export function requeueInboundItem(db: DatabaseSync, clock: Clock, id: string): boolean {
   const res = db
     .prepare(
       `UPDATE inbound_item SET status = 'queued', attempt_count = 0, updated_at = ?
@@ -134,27 +140,20 @@ export function requeueInboundItem(db: Db, clock: Clock, id: string): boolean {
 
 // ---- bills ---------------------------------------------------------------------------------
 
-export interface NewBill {
+/** A verified bill plus where it came from. */
+export type NewBill = VerifiedBill & {
   inboundItemId: string;
   senderDomain: string;
-  supplierName: string;
-  invoiceNumber: string;
-  payerId: string | null;
-  amountMinor: number;
-  currency: string;
-  issueDate: string | null;
-  dueDate: string;
-  iban: string | null;
   extractionJson: string;
   extractor: string;
-}
+};
 
 export function normalizeInvoiceNumber(invoiceNumber: string): string {
   return invoiceNumber.replace(/\s+/g, "").toUpperCase();
 }
 
 /** Returns false when the same invoice from the same sender already exists. */
-export function insertBill(db: Db, clock: Clock, bill: NewBill): boolean {
+export function insertBill(db: DatabaseSync, clock: Clock, bill: NewBill): boolean {
   const res = db
     .prepare(
       `INSERT INTO bill (id, inbound_item_id, sender_domain, supplier_name, invoice_number,
@@ -214,20 +213,20 @@ const BILL_SELECT = `SELECT b.id, b.inbound_item_id, b.sender_domain, b.supplier
   FROM bill b
   LEFT JOIN bill_match m ON m.bill_id = b.id AND m.revoked_at IS NULL`;
 
-export function listActiveBills(db: Db): BillRow[] {
-  return all(
+export function listActiveBills(db: DatabaseSync): BillRow[] {
+  return parseRows(
     billRow,
     db.prepare(`${BILL_SELECT} WHERE b.lifecycle = 'active' ORDER BY b.due_date DESC`).all(),
   );
 }
 
-export function getBill(db: Db, id: string): BillRow | undefined {
-  return one(billRow, db.prepare(`${BILL_SELECT} WHERE b.id = ?`).get(id));
+export function getBill(db: DatabaseSync, id: string): BillRow | undefined {
+  return parseRow(billRow, db.prepare(`${BILL_SELECT} WHERE b.id = ?`).get(id));
 }
 
 /** Active bills without an active match, oldest due first: the order auto-matching claims in. */
-export function unmatchedBills(db: Db): BillRow[] {
-  return all(
+export function listUnmatchedBills(db: DatabaseSync): BillRow[] {
+  return parseRows(
     billRow,
     db
       .prepare(
@@ -238,7 +237,7 @@ export function unmatchedBills(db: Db): BillRow[] {
   );
 }
 
-export function dismissBill(db: Db, id: string): boolean {
+export function dismissBill(db: DatabaseSync, id: string): boolean {
   return (
     db
       .prepare(`UPDATE bill SET lifecycle = 'dismissed' WHERE id = ? AND lifecycle = 'active'`)

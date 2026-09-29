@@ -3,11 +3,9 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { z } from "zod";
 
-export type Db = DatabaseSync;
-
 const MIGRATIONS_DIR = path.join(import.meta.dirname, "..", "..", "migrations");
 
-export function openDb(file: string): Db {
+export function openDb(file: string): DatabaseSync {
   const db = new DatabaseSync(file);
   db.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;");
   return db;
@@ -18,7 +16,7 @@ export function openDb(file: string): Db {
  * last applied number in `PRAGMA user_version`. Throws on the first failure; the caller exits.
  * Tests run the same chain on `:memory:`.
  */
-export function migrate(db: Db): number {
+export function migrate(db: DatabaseSync): number {
   const current = z
     .object({ user_version: z.number() })
     .parse(db.prepare("PRAGMA user_version").get()).user_version;
@@ -31,7 +29,7 @@ export function migrate(db: Db): number {
     if (n <= current) continue;
     if (n !== version + 1) throw new Error(`Migration gap: expected ${version + 1}, found ${file}`);
     const sql = readFileSync(path.join(MIGRATIONS_DIR, file), "utf8");
-    transaction(db, () => {
+    withTransaction(db, () => {
       db.exec(sql);
       db.exec(`PRAGMA user_version = ${n}`);
     });
@@ -45,11 +43,12 @@ export function migrate(db: Db): number {
  * `await` inside BEGIN…COMMIT would let unrelated async work write into this transaction.
  * The signature makes that impossible — a Promise return is rejected.
  */
-export function transaction<T>(db: Db, fn: () => T): T {
+export function withTransaction<T>(db: DatabaseSync, fn: () => T): T {
   db.exec("BEGIN IMMEDIATE");
   try {
     const result = fn();
-    if (result instanceof Promise) throw new Error("transaction() callback must be synchronous");
+    if (result instanceof Promise)
+      throw new Error("withTransaction() callback must be synchronous");
     db.exec("COMMIT");
     return result;
   } catch (err) {

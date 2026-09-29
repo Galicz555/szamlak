@@ -2,6 +2,8 @@ import { randomBytes } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import path from "node:path";
+import type { DatabaseSync } from "node:sqlite";
+import type { Logger } from "pino";
 import { z } from "zod";
 import type { BankFeed } from "../bank/enable-banking.ts";
 import {
@@ -12,21 +14,21 @@ import {
   takeOauthState,
 } from "../bank/repo.ts";
 import {
-  deadLetteredItems,
   dismissBill,
   getBill,
   getInboundItem,
   listActiveBills,
+  listDeadLetteredInboundItems,
   requeueInboundItem,
 } from "../bills/repo.ts";
-import { transaction, type Db } from "../db/db.ts";
+import { withTransaction } from "../db/db.ts";
 import { AppError, categoryOf, codeOf } from "../errors.ts";
-import { errorText, type Logger } from "../log.ts";
-import { confirmMatch, revokeMatch, suggestionsFor } from "../match/matching.ts";
+import { errorText } from "../log.ts";
+import { confirmMatch, listCandidates, revokeMatch } from "../match/matching.ts";
 import type { Poller } from "../poll/poller.ts";
-import { lastRun } from "../poll/runs.ts";
+import { getLastRun } from "../poll/runs.ts";
 import { todayIn, type Clock } from "../shared/time.ts";
-import { guardRequest, HTML_SECURITY_HEADERS } from "./guard.ts";
+import { guardRequest, HTML_SECURITY_HEADERS, isBankLoginUrl } from "./guard.ts";
 import { html, type Html } from "./html.ts";
 import {
   bankPage,
@@ -39,7 +41,7 @@ import {
 } from "./pages.ts";
 
 export interface WebDeps {
-  db: Db;
+  db: DatabaseSync;
   clock: Clock;
   log: Logger;
   poller: Poller;
@@ -53,8 +55,11 @@ export interface WebDeps {
 const MAX_FORM_BYTES = 16 * 1024;
 const MAX_CONSENT_SECONDS = 180 * 86_400;
 const CONSENT_WARN_DAYS = 14;
-// The consent flow always starts on Enable Banking's own pages; anything else is refused.
-const AUTH_HOST = "enablebanking.com";
+const OAUTH_STATE_BYTES = 24;
+const OAUTH_STATE_TTL_MS = 30 * 60_000;
+const ASPSP_COUNTRY = "HU";
+// req.url is only a path; URL needs some origin to resolve it against.
+const URL_BASE = "http://x";
 
 const uuid = z.uuid();
 const filterSchema = z.enum(["all", "awaiting", "overdue", "paid"]).catch("all");
@@ -81,7 +86,7 @@ async function readForm(req: IncomingMessage): Promise<Record<string, string>> {
   return Object.fromEntries(new URLSearchParams(Buffer.concat(chunks).toString("utf8")));
 }
 
-function parse<S extends z.ZodType>(schema: S, value: unknown): z.infer<S> {
+function parseInput<S extends z.ZodType>(schema: S, value: unknown): z.infer<S> {
   const r = schema.safeParse(value);
   if (!r.success) throw new AppError("invalid", "BAD_INPUT", z.prettifyError(r.error));
   return r.data;
@@ -118,7 +123,7 @@ function sendFile(res: ServerResponse, file: string): void {
   });
 }
 
-function statusBar(d: WebDeps): StatusBar {
+function getStatusBar(d: WebDeps): StatusBar {
   const now = d.clock.now().getTime();
   const consentWarnings = [
     ...new Map(listAccounts(d.db).map((a) => [a.aspsp_name, a.valid_until])).entries(),
@@ -131,12 +136,12 @@ function statusBar(d: WebDeps): StatusBar {
   return {
     running: d.poller.running,
     runs: [
-      { label: "Levelek", run: lastRun(d.db, "mail") },
-      { label: "Kiolvasás", run: lastRun(d.db, "extract") },
-      { label: "Bank", run: lastRun(d.db, "bank") },
-      { label: "Mentés", run: lastRun(d.db, "backup") },
+      { label: "Levelek", run: getLastRun(d.db, "mail") },
+      { label: "Kiolvasás", run: getLastRun(d.db, "extract") },
+      { label: "Bank", run: getLastRun(d.db, "bank") },
+      { label: "Mentés", run: getLastRun(d.db, "backup") },
     ],
-    deadLettered: deadLetteredItems(d.db).length,
+    deadLettered: listDeadLetteredInboundItems(d.db).length,
     consentWarnings,
   };
 }
@@ -145,7 +150,7 @@ async function completeBankSession(d: WebDeps, code: string, state: string): Pro
   const aspsp = takeOauthState(d.db, d.clock, state);
   if (!aspsp) throw new AppError("invalid", "OAUTH_STATE_INVALID", "Unknown or expired state");
   const session = await d.feed.createSession(code);
-  transaction(d.db, () => {
+  withTransaction(d.db, () => {
     saveSession(d.db, d.clock, {
       sessionId: session.sessionId,
       aspspName: aspsp.name,
@@ -176,13 +181,13 @@ const routes: { method: string; pattern: RegExp; handler: Handler }[] = [
     method: "GET",
     pattern: /^\/$/,
     handler: (d, req, res) => {
-      const url = new URL(req.url ?? "/", "http://x");
+      const url = new URL(req.url ?? "/", URL_BASE);
       const filter = filterSchema.parse(url.searchParams.get("filter") ?? "all");
       const today = todayIn(d.clock, d.timeZone);
       sendHtml(
         res,
         200,
-        layout("Számlák", statusBar(d), billsPage(listActiveBills(d.db), today, filter)),
+        layout("Számlák", getStatusBar(d), billsPage(listActiveBills(d.db), today, filter)),
       );
     },
   },
@@ -190,14 +195,14 @@ const routes: { method: string; pattern: RegExp; handler: Handler }[] = [
     method: "GET",
     pattern: /^\/bills\/([^/]+)$/,
     handler: (d, _req, res, [id = ""]) => {
-      const bill = getBill(d.db, parse(uuid, id));
+      const bill = getBill(d.db, parseInput(uuid, id));
       if (!bill) throw new AppError("not_found", "BILL_NOT_FOUND", "No such bill");
       const matchedTx = bill.match_transaction_id
         ? getTransaction(d.db, bill.match_transaction_id)
         : undefined;
       const candidates = matchedTx
         ? []
-        : suggestionsFor(d.db, bill.id).flatMap((c) => {
+        : listCandidates(d.db, bill.id).flatMap((c) => {
             const tx = getTransaction(d.db, c.transactionId);
             return tx ? [{ candidate: c, tx }] : [];
           });
@@ -207,7 +212,7 @@ const routes: { method: string; pattern: RegExp; handler: Handler }[] = [
         200,
         layout(
           `${bill.supplier_name} · ${bill.invoice_number}`,
-          statusBar(d),
+          getStatusBar(d),
           billPage(bill, today, matchedTx, candidates),
         ),
       );
@@ -217,7 +222,7 @@ const routes: { method: string; pattern: RegExp; handler: Handler }[] = [
     method: "GET",
     pattern: /^\/bills\/([^/]+)\/file$/,
     handler: (d, _req, res, [id = ""]) => {
-      const bill = getBill(d.db, parse(uuid, id));
+      const bill = getBill(d.db, parseInput(uuid, id));
       const item = bill ? getInboundItem(d.db, bill.inbound_item_id) : undefined;
       if (!item) throw new AppError("not_found", "FILE_NOT_FOUND", "No such file");
       sendFile(res, path.join(d.dataDir, item.file_path));
@@ -227,8 +232,8 @@ const routes: { method: string; pattern: RegExp; handler: Handler }[] = [
     method: "POST",
     pattern: /^\/bills\/([^/]+)\/match$/,
     handler: async (d, req, res, [id = ""]) => {
-      const billId = parse(uuid, id);
-      const form = parse(matchForm, await readForm(req));
+      const billId = parseInput(uuid, id);
+      const form = parseInput(matchForm, await readForm(req));
       confirmMatch(d.db, d.clock, billId, form.transactionId);
       redirect(res, `/bills/${billId}`);
     },
@@ -237,7 +242,7 @@ const routes: { method: string; pattern: RegExp; handler: Handler }[] = [
     method: "POST",
     pattern: /^\/bills\/([^/]+)\/unmatch$/,
     handler: (d, _req, res, [id = ""]) => {
-      const billId = parse(uuid, id);
+      const billId = parseInput(uuid, id);
       revokeMatch(d.db, d.clock, billId);
       redirect(res, `/bills/${billId}`);
     },
@@ -246,7 +251,7 @@ const routes: { method: string; pattern: RegExp; handler: Handler }[] = [
     method: "POST",
     pattern: /^\/bills\/([^/]+)\/dismiss$/,
     handler: (d, _req, res, [id = ""]) => {
-      dismissBill(d.db, parse(uuid, id));
+      dismissBill(d.db, parseInput(uuid, id));
       redirect(res, "/");
     },
   },
@@ -257,7 +262,11 @@ const routes: { method: string; pattern: RegExp; handler: Handler }[] = [
       sendHtml(
         res,
         200,
-        layout("Kézi beavatkozás kell", statusBar(d), inboxPage(deadLetteredItems(d.db))),
+        layout(
+          "Kézi beavatkozás kell",
+          getStatusBar(d),
+          inboxPage(listDeadLetteredInboundItems(d.db)),
+        ),
       );
     },
   },
@@ -265,7 +274,7 @@ const routes: { method: string; pattern: RegExp; handler: Handler }[] = [
     method: "GET",
     pattern: /^\/inbox\/([^/]+)\/file$/,
     handler: (d, _req, res, [id = ""]) => {
-      const item = getInboundItem(d.db, parse(uuid, id));
+      const item = getInboundItem(d.db, parseInput(uuid, id));
       if (!item) throw new AppError("not_found", "FILE_NOT_FOUND", "No such file");
       sendFile(res, path.join(d.dataDir, item.file_path));
     },
@@ -274,7 +283,7 @@ const routes: { method: string; pattern: RegExp; handler: Handler }[] = [
     method: "POST",
     pattern: /^\/inbox\/([^/]+)\/retry$/,
     handler: (d, _req, res, [id = ""]) => {
-      requeueInboundItem(d.db, d.clock, parse(uuid, id));
+      requeueInboundItem(d.db, d.clock, parseInput(uuid, id));
       void d.poller.trigger();
       redirect(res, "/inbox");
     },
@@ -291,18 +300,18 @@ const routes: { method: string; pattern: RegExp; handler: Handler }[] = [
     method: "GET",
     pattern: /^\/bank$/,
     handler: async (d, req, res) => {
-      const url = new URL(req.url ?? "/", "http://x");
+      const url = new URL(req.url ?? "/", URL_BASE);
       const message = url.searchParams.get("ok") === "1" ? "A bankkapcsolat elmentve." : null;
       let aspsps: { name: string; country: string }[] | { error: string };
       try {
-        aspsps = await d.feed.listAspsps("HU");
+        aspsps = await d.feed.listAspsps(ASPSP_COUNTRY);
       } catch (err: unknown) {
-        aspsps = { error: errorText(err, 200) };
+        aspsps = { error: errorText(err, { maxChars: 200 }) };
       }
       sendHtml(
         res,
         200,
-        layout("Bankkapcsolat", statusBar(d), bankPage(listAccounts(d.db), aspsps, message)),
+        layout("Bankkapcsolat", getStatusBar(d), bankPage(listAccounts(d.db), aspsps, message)),
       );
     },
   },
@@ -310,17 +319,17 @@ const routes: { method: string; pattern: RegExp; handler: Handler }[] = [
     method: "POST",
     pattern: /^\/bank\/connect$/,
     handler: async (d, req, res) => {
-      const wanted = parse(connectForm, await readForm(req));
+      const wanted = parseInput(connectForm, await readForm(req));
       const aspsp = (await d.feed.listAspsps(wanted.country)).find((a) => a.name === wanted.name);
       if (!aspsp) throw new AppError("invalid", "ASPSP_UNKNOWN", "Unknown bank");
       const seconds = Math.min(aspsp.maxConsentSeconds, MAX_CONSENT_SECONDS);
       const validUntil = new Date(d.clock.now().getTime() + seconds * 1000).toISOString();
-      const state = randomBytes(24).toString("base64url");
+      const state = randomBytes(OAUTH_STATE_BYTES).toString("base64url");
       saveOauthState(
         d.db,
         state,
         aspsp,
-        new Date(d.clock.now().getTime() + 30 * 60_000).toISOString(),
+        new Date(d.clock.now().getTime() + OAUTH_STATE_TTL_MS).toISOString(),
       );
       const { url } = await d.feed.startAuthorisation({
         aspsp: { name: aspsp.name, country: aspsp.country },
@@ -328,12 +337,11 @@ const routes: { method: string; pattern: RegExp; handler: Handler }[] = [
         validUntil,
         redirectUrl: d.redirectUrl,
       });
-      const host = new URL(url).hostname;
-      if (!url.startsWith("https://") || !(host === AUTH_HOST || host.endsWith(`.${AUTH_HOST}`))) {
+      if (!isBankLoginUrl(url)) {
         throw new AppError(
           "invalid",
           "AUTH_URL_UNEXPECTED",
-          `Unexpected bank login address: ${host}`,
+          `Unexpected bank login address: ${new URL(url).hostname}`,
         );
       }
       redirect(res, url);
@@ -343,7 +351,7 @@ const routes: { method: string; pattern: RegExp; handler: Handler }[] = [
     method: "GET",
     pattern: /^\/bank\/callback$/,
     handler: async (d, req, res) => {
-      const url = new URL(req.url ?? "/", "http://x");
+      const url = new URL(req.url ?? "/", URL_BASE);
       const code = url.searchParams.get("code");
       const state = url.searchParams.get("state");
       if (!code || !state) {
@@ -363,7 +371,7 @@ const routes: { method: string; pattern: RegExp; handler: Handler }[] = [
     method: "POST",
     pattern: /^\/bank\/callback-paste$/,
     handler: async (d, req, res) => {
-      const pasted = new URL(parse(pasteForm, await readForm(req)).url);
+      const pasted = new URL(parseInput(pasteForm, await readForm(req)).url);
       const code = pasted.searchParams.get("code");
       const state = pasted.searchParams.get("state");
       if (!code || !state)
@@ -404,7 +412,7 @@ export function createWebServer(d: WebDeps): Server {
       res.end(guard.reason);
       return;
     }
-    const pathname = new URL(req.url ?? "/", "http://x").pathname;
+    const pathname = new URL(req.url ?? "/", URL_BASE).pathname;
     for (const r of routes) {
       if (r.method !== method) continue;
       const m = r.pattern.exec(pathname);
@@ -423,11 +431,15 @@ export function createWebServer(d: WebDeps): Server {
             return;
           }
           const message = err instanceof AppError ? `${err.code}: ${err.message}` : "Váratlan hiba";
-          sendHtml(res, status, layout("Hiba", statusBar(d), htmlError(message)));
+          sendHtml(res, status, layout("Hiba", getStatusBar(d), htmlError(message)));
         });
       return;
     }
-    sendHtml(res, 404, layout("Nincs ilyen oldal", statusBar(d), htmlError("Nincs ilyen oldal.")));
+    sendHtml(
+      res,
+      404,
+      layout("Nincs ilyen oldal", getStatusBar(d), htmlError("Nincs ilyen oldal.")),
+    );
   });
 }
 

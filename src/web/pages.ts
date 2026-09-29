@@ -1,6 +1,6 @@
 import type { AccountRow, TransactionRow } from "../bank/repo.ts";
 import type { BillRow, InboundItem } from "../bills/repo.ts";
-import { billState, billStateLabel, type BillState } from "../bills/status.ts";
+import { billState, BILL_STATE_LABELS, type BillState } from "../bills/status.ts";
 import type { Candidate } from "../match/engine.ts";
 import type { RunRow } from "../poll/runs.ts";
 import { formatMinor } from "../shared/money.ts";
@@ -13,7 +13,7 @@ export interface StatusBar {
   consentWarnings: string[];
 }
 
-const fmtInstant = (iso: string): string =>
+const formatInstant = (iso: string): string =>
   new Intl.DateTimeFormat("hu-HU", {
     dateStyle: "short",
     timeStyle: "short",
@@ -29,7 +29,7 @@ function statusBar(s: StatusBar): Html {
             ${label}:
             ${
               run
-                ? html`${fmtInstant(run.started_at)}
+                ? html`${formatInstant(run.started_at)}
                   ${run.outcome === "error" ? html` — hiba: ${run.error}` : run.outcome === null ? " — fut" : ""}`
                 : "még nem futott"
             }
@@ -80,9 +80,9 @@ export function layout(title: string, status: StatusBar, body: Html): Html {
 
 const FILTERS: { key: "all" | BillState; label: string }[] = [
   { key: "all", label: "Mind" },
-  { key: "awaiting", label: "Fizetésre vár" },
-  { key: "overdue", label: "Lejárt" },
-  { key: "paid", label: "Fizetve" },
+  { key: "awaiting", label: BILL_STATE_LABELS.awaiting },
+  { key: "overdue", label: BILL_STATE_LABELS.overdue },
+  { key: "paid", label: BILL_STATE_LABELS.paid },
 ];
 
 export function billsPage(bills: BillRow[], today: string, filter: "all" | BillState): Html {
@@ -124,7 +124,7 @@ export function billsPage(bills: BillRow[], today: string, filter: "all" | BillS
                     <td><a href="/bills/${b.id}">${b.invoice_number}</a></td>
                     <td class="num">${formatMinor(b.amount_minor, b.currency)}</td>
                     <td>${b.due_date}</td>
-                    <td><span class="badge ${state}">${billStateLabel(state)}</span></td>
+                    <td><span class="badge ${state}">${BILL_STATE_LABELS[state]}</span></td>
                   </tr>`,
               )}
             </tbody>
@@ -142,7 +142,7 @@ export function billPage(
     { hasActiveMatch: bill.match_id !== null, dueDate: bill.due_date },
     today,
   );
-  return html` <p><span class="badge ${state}">${billStateLabel(state)}</span></p>
+  return html` <p><span class="badge ${state}">${BILL_STATE_LABELS[state]}</span></p>
     <dl>
       <dt>Szolgáltató</dt>
       <dd>${bill.supplier_name} (${bill.sender_domain})</dd>
@@ -232,7 +232,7 @@ export function inboxPage(items: InboundItem[]): Html {
         ${items.map(
           (i) =>
             html`<tr>
-              <td>${fmtInstant(i.received_at)}</td>
+              <td>${formatInstant(i.received_at)}</td>
               <td>${i.sender}</td>
               <td><a href="/inbox/${i.id}/file">${i.subject || "(nincs tárgy)"}</a></td>
               <td>${i.last_error_code}: ${i.last_error}</td>
@@ -275,7 +275,7 @@ export function bankPage(
                   html`<tr>
                     <td>${a.aspsp_name}</td>
                     <td>${a.name ?? ""} ${a.iban ?? ""} ${a.currency ?? ""}</td>
-                    <td>${fmtInstant(a.valid_until)}</td>
+                    <td>${formatInstant(a.valid_until)}</td>
                     <td>${a.last_booking_date ?? "—"}</td>
                   </tr>`,
               )}

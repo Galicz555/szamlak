@@ -5,10 +5,10 @@ import type { z } from "zod";
  * migration but not in a query fails here, in the test that runs the query, not as `undefined`
  * three calls later.
  */
-export function one<S extends z.ZodType>(schema: S, row: unknown): z.infer<S> | undefined {
+export function parseRow<S extends z.ZodType>(schema: S, row: unknown): z.infer<S> | undefined {
   return row === undefined ? undefined : schema.parse(row);
 }
 
-export function all<S extends z.ZodType>(schema: S, rows: unknown[]): z.infer<S>[] {
+export function parseRows<S extends z.ZodType>(schema: S, rows: unknown[]): z.infer<S>[] {
   return rows.map((r) => schema.parse(r));
 }

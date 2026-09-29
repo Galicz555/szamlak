@@ -1,8 +1,8 @@
 import { copyFile, mkdir, readdir, rm } from "node:fs/promises";
 import path from "node:path";
-import type { Db } from "../db/db.ts";
+import type { DatabaseSync } from "node:sqlite";
 
-const PREFIX = "szamlak-";
+const SNAPSHOT_PREFIX = "szamlak-";
 
 /**
  * Daily snapshot: `VACUUM INTO` gives a consistent copy while the app runs. The bill PDFs are
@@ -10,11 +10,11 @@ const PREFIX = "szamlak-";
  * Older snapshots beyond `keep` are pruned; PDFs are never pruned.
  */
 export async function backup(
-  db: Db,
+  db: DatabaseSync,
   opts: { dataDir: string; backupDir: string; today: string; keep: number },
 ): Promise<string> {
   await mkdir(path.join(opts.backupDir, "files"), { recursive: true });
-  const target = path.join(opts.backupDir, `${PREFIX}${opts.today}.db`);
+  const target = path.join(opts.backupDir, `${SNAPSHOT_PREFIX}${opts.today}.db`);
   await rm(target, { force: true });
   db.prepare("VACUUM INTO ?").run(target);
 
@@ -26,9 +26,7 @@ export async function backup(
       await copyFile(path.join(filesDir, name), path.join(opts.backupDir, "files", name));
   }
 
-  const snapshots = (await readdir(opts.backupDir))
-    .filter((f) => f.startsWith(PREFIX) && f.endsWith(".db"))
-    .sort();
+  const snapshots = await listSnapshots(opts.backupDir);
   for (const old of snapshots.slice(0, Math.max(0, snapshots.length - opts.keep))) {
     await rm(path.join(opts.backupDir, old));
   }
@@ -36,9 +34,13 @@ export async function backup(
 }
 
 export async function latestSnapshot(backupDir: string): Promise<string | undefined> {
-  const snapshots = (await readdir(backupDir))
-    .filter((f) => f.startsWith(PREFIX) && f.endsWith(".db"))
-    .sort();
-  const last = snapshots.at(-1);
+  const last = (await listSnapshots(backupDir)).at(-1);
   return last ? path.join(backupDir, last) : undefined;
+}
+
+/** Snapshot file names, oldest first (the date in the name sorts). */
+async function listSnapshots(backupDir: string): Promise<string[]> {
+  return (await readdir(backupDir))
+    .filter((f) => f.startsWith(SNAPSHOT_PREFIX) && f.endsWith(".db"))
+    .sort();
 }

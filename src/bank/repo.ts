@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
+import type { DatabaseSync } from "node:sqlite";
 import { z } from "zod";
-import type { Db } from "../db/db.ts";
-import { all, one } from "../db/rows.ts";
+import { parseRow, parseRows } from "../db/rows.ts";
 import { instant, type Clock } from "../shared/time.ts";
 
 // ---- sessions and accounts -----------------------------------------------------------------
@@ -24,7 +24,7 @@ export interface NewSession {
  * Stores a new consent and points its accounts at it. A renewal of the same bank keeps each
  * account row (keyed by IBAN) so its transaction history and matches stay attached.
  */
-export function saveSession(db: Db, clock: Clock, s: NewSession): void {
+export function saveSession(db: DatabaseSync, clock: Clock, s: NewSession): void {
   const now = instant(clock);
   db.prepare(
     `INSERT INTO bank_session (id, session_id, aspsp_name, aspsp_country, valid_until, created_at)
@@ -67,8 +67,8 @@ const accountRow = z.object({
 });
 export type AccountRow = z.infer<typeof accountRow>;
 
-export function listAccounts(db: Db): AccountRow[] {
-  return all(
+export function listAccounts(db: DatabaseSync): AccountRow[] {
+  return parseRows(
     accountRow,
     db
       .prepare(
@@ -97,7 +97,7 @@ export interface NewTransaction {
 
 /** Upsert-by-ignore: the bank is the source of truth and a booked entry does not change. */
 export function insertTransactions(
-  db: Db,
+  db: DatabaseSync,
   clock: Clock,
   accountId: string,
   txs: NewTransaction[],
@@ -150,8 +150,8 @@ const TX_SELECT = `SELECT t.id, t.account_id, t.direction, t.amount_minor, t.cur
   JOIN bank_session s ON s.session_id = a.session_id`;
 
 /** Debits in a date window that no active match has claimed yet. */
-export function unmatchedDebits(db: Db, from: string, to: string): TransactionRow[] {
-  return all(
+export function listUnmatchedDebits(db: DatabaseSync, from: string, to: string): TransactionRow[] {
+  return parseRows(
     txRow,
     db
       .prepare(
@@ -165,14 +165,14 @@ export function unmatchedDebits(db: Db, from: string, to: string): TransactionRo
   );
 }
 
-export function getTransaction(db: Db, id: string): TransactionRow | undefined {
-  return one(txRow, db.prepare(`${TX_SELECT} WHERE t.id = ?`).get(id));
+export function getTransaction(db: DatabaseSync, id: string): TransactionRow | undefined {
+  return parseRow(txRow, db.prepare(`${TX_SELECT} WHERE t.id = ?`).get(id));
 }
 
 // ---- oauth state ---------------------------------------------------------------------------
 
 export function saveOauthState(
-  db: Db,
+  db: DatabaseSync,
   state: string,
   aspsp: { name: string; country: string },
   expiresAt: string,
@@ -184,11 +184,11 @@ export function saveOauthState(
 
 /** Single use: the row is deleted whether or not it has expired. */
 export function takeOauthState(
-  db: Db,
+  db: DatabaseSync,
   clock: Clock,
   state: string,
 ): { name: string; country: string } | undefined {
-  const row = one(
+  const row = parseRow(
     z.object({ aspsp_name: z.string(), aspsp_country: z.string(), expires_at: z.string() }),
     db
       .prepare(

@@ -1,5 +1,9 @@
 import { z } from "zod";
 
+/** Currencies a bill can be accepted in. */
+export const BILL_CURRENCIES = ["HUF", "EUR"] as const;
+export type BillCurrency = (typeof BILL_CURRENCIES)[number];
+
 /** What any extractor must return. Validated before anything else reads it. */
 export const extractionSchema = z
   .object({
@@ -41,7 +45,7 @@ export const extractionJsonSchema = {
     invoice_number: nullableString,
     payer_id: nullableString,
     amount_due_text: nullableString,
-    currency: { anyOf: [{ type: "string", enum: ["HUF", "EUR"] }, { type: "null" }] },
+    currency: { anyOf: [{ type: "string", enum: [...BILL_CURRENCIES] }, { type: "null" }] },
     issue_date: nullableString,
     due_date: nullableString,
     iban: nullableString,
@@ -59,7 +63,7 @@ export const extractionGeminiSchema = {
     invoice_number: { type: "STRING", nullable: true },
     payer_id: { type: "STRING", nullable: true },
     amount_due_text: { type: "STRING", nullable: true },
-    currency: { type: "STRING", enum: ["HUF", "EUR"], nullable: true },
+    currency: { type: "STRING", enum: [...BILL_CURRENCIES], nullable: true },
     issue_date: { type: "STRING", nullable: true },
     due_date: { type: "STRING", nullable: true },
     iban: { type: "STRING", nullable: true },

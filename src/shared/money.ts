@@ -6,8 +6,9 @@
  * thousands separator, because Hungarian bills group HUF amounts that way and HUF has
  * no fillér in practice; the currency's minor-unit count still applies to the result.
  *
- * nova: number + Number.isSafeInteger instead of bigint (guide C§6.2); safe up to 9e15 minor
- * units, far past any household bill. Switch to bigint if amounts ever get summed across years.
+ * nova: number + Number.isSafeInteger instead of bigint (see docs/assumptions.md); safe up to
+ * 9e15 minor units, far past any household bill. Switch to bigint if amounts ever get summed
+ * across years.
  */
 export function parseAmountMinor(text: string, minorDigits: number): number {
   const cleaned = text

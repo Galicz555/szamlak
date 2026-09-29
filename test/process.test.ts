@@ -2,9 +2,13 @@ import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import type { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
-import { deadLetteredItems, insertInboundItem, listActiveBills } from "../src/bills/repo.ts";
-import type { Db } from "../src/db/db.ts";
+import {
+  listDeadLetteredInboundItems,
+  insertInboundItem,
+  listActiveBills,
+} from "../src/bills/repo.ts";
 import { AppError } from "../src/errors.ts";
 import type { BillExtractor } from "../src/extract/extractors.ts";
 import { processQueue } from "../src/extract/process.ts";
@@ -44,7 +48,7 @@ function fakeExtractor(
   };
 }
 
-function queueOne(db: Db, clock: ReturnType<typeof fixedClock>): string {
+function queueOne(db: DatabaseSync, clock: ReturnType<typeof fixedClock>): string {
   const dir = mkdtempSync(path.join(tmpdir(), "szamlak-"));
   writeFileSync(path.join(dir, "body.txt"), TEXT);
   insertInboundItem(db, clock, {
@@ -66,11 +70,33 @@ test("a verified extraction becomes a bill; the same invoice again is a duplicat
   const db = memDb();
   const clock = fixedClock("2026-09-20T10:00:00Z");
   const dataDir = queueOne(db, clock);
-  const extractor = fakeExtractor([() => good]);
-  const r = await processQueue({ db, clock, log: silentLog, extractor, dataDir, maxAttempts: 3 });
+  const extractor = fakeExtractor([() => good, () => good]);
+  const deps = { db, clock, log: silentLog, extractor };
+  const r = await processQueue(deps, { dataDir, maxAttempts: 3 });
   assert.deepEqual(r, { done: 1, failed: 0 });
   const [bill] = listActiveBills(db);
   assert.equal(bill?.amount_minor, 899_000);
+
+  // The same bill again, in another message (a reminder with a re-rendered PDF).
+  insertInboundItem(db, clock, {
+    contentSha256: "sha-2",
+    kind: "body",
+    mailbox: "INBOX",
+    uidValidity: "1",
+    uid: 8,
+    sender: "szamla@telekom.hu",
+    senderDomain: "telekom.hu",
+    subject: "Emlékeztető",
+    receivedAt: "2026-09-21T08:00:00Z",
+    filePath: "body.txt",
+  });
+  assert.deepEqual(await processQueue(deps, { dataDir, maxAttempts: 3 }), { done: 1, failed: 0 });
+  assert.equal(listActiveBills(db).length, 1);
+  const results = db.prepare("SELECT result_code FROM inbound_item ORDER BY uid").all();
+  assert.deepEqual(
+    results.map((row) => row.result_code),
+    ["bill_created", "duplicate_bill"],
+  );
   assert.equal(extractor.left(), 0);
 });
 
@@ -79,7 +105,7 @@ test("a wrong answer gets exactly one corrective retry that names the failed che
   const clock = fixedClock("2026-09-20T10:00:00Z");
   const dataDir = queueOne(db, clock);
   const extractor = fakeExtractor([() => ({ ...good, amount_due_text: "9 890" }), () => good]);
-  await processQueue({ db, clock, log: silentLog, extractor, dataDir, maxAttempts: 3 });
+  await processQueue({ db, clock, log: silentLog, extractor }, { dataDir, maxAttempts: 3 });
   assert.deepEqual(extractor.calls, [undefined, "amount_due_text not found in text"]);
   assert.equal(listActiveBills(db).length, 1);
 });
@@ -90,9 +116,9 @@ test("a model that stays wrong dead-letters the item instead of inventing a bill
   const dataDir = queueOne(db, clock);
   const wrong = { ...good, due_date: "2026-10-16" };
   const extractor = fakeExtractor([() => wrong, () => wrong]);
-  await processQueue({ db, clock, log: silentLog, extractor, dataDir, maxAttempts: 3 });
+  await processQueue({ db, clock, log: silentLog, extractor }, { dataDir, maxAttempts: 3 });
   assert.equal(listActiveBills(db).length, 0);
-  const [item] = deadLetteredItems(db);
+  const [item] = listDeadLetteredInboundItems(db);
   assert.equal(item?.last_error_code, "EXTRACTION_UNVERIFIED");
 });
 
@@ -106,7 +132,7 @@ test("the model server being down spends no attempts and fails the pass", async 
     },
   ]);
   await assert.rejects(
-    processQueue({ db, clock, log: silentLog, extractor, dataDir, maxAttempts: 3 }),
+    processQueue({ db, clock, log: silentLog, extractor }, { dataDir, maxAttempts: 3 }),
     /down/,
   );
   const row = db.prepare("SELECT status, attempt_count FROM inbound_item").get();
@@ -121,8 +147,8 @@ test("a transient failure stays queued until the attempt cap, then dead-letters"
     throw new AppError("transient", "EXTRACTOR_HTTP_503", "busy");
   };
   const extractor = fakeExtractor([busy, busy]);
-  await processQueue({ db, clock, log: silentLog, extractor, dataDir, maxAttempts: 2 });
-  assert.equal(deadLetteredItems(db).length, 0);
-  await processQueue({ db, clock, log: silentLog, extractor, dataDir, maxAttempts: 2 });
-  assert.equal(deadLetteredItems(db).length, 1);
+  await processQueue({ db, clock, log: silentLog, extractor }, { dataDir, maxAttempts: 2 });
+  assert.equal(listDeadLetteredInboundItems(db).length, 0);
+  await processQueue({ db, clock, log: silentLog, extractor }, { dataDir, maxAttempts: 2 });
+  assert.equal(listDeadLetteredInboundItems(db).length, 1);
 });

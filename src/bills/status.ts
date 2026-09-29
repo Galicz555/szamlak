@@ -12,13 +12,8 @@ export function billState(
   return bill.dueDate < today ? "overdue" : "awaiting";
 }
 
-export function billStateLabel(state: BillState): string {
-  switch (state) {
-    case "paid":
-      return "Fizetve";
-    case "awaiting":
-      return "Fizetésre vár";
-    case "overdue":
-      return "Lejárt";
-  }
-}
+export const BILL_STATE_LABELS: Readonly<Record<BillState, string>> = {
+  paid: "Fizetve",
+  awaiting: "Fizetésre vár",
+  overdue: "Lejárt",
+};

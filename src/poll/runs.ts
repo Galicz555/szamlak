@@ -1,12 +1,12 @@
 import { randomUUID } from "node:crypto";
+import type { DatabaseSync } from "node:sqlite";
 import { z } from "zod";
-import type { Db } from "../db/db.ts";
-import { one } from "../db/rows.ts";
+import { parseRow } from "../db/rows.ts";
 import { instant, type Clock } from "../shared/time.ts";
 
 export type RunKind = "mail" | "extract" | "bank" | "backup";
 
-export function startRun(db: Db, clock: Clock, kind: RunKind): string {
+export function startRun(db: DatabaseSync, clock: Clock, kind: RunKind): string {
   const id = randomUUID();
   db.prepare(`INSERT INTO poll_run (id, kind, started_at) VALUES (?, ?, ?)`).run(
     id,
@@ -16,7 +16,13 @@ export function startRun(db: Db, clock: Clock, kind: RunKind): string {
   return id;
 }
 
-export function finishRun(db: Db, clock: Clock, id: string, error: string | null): void {
+/** `error: null` records the run as ok. */
+export function finishRun(
+  db: DatabaseSync,
+  clock: Clock,
+  id: string,
+  { error }: { error: string | null },
+): void {
   db.prepare(`UPDATE poll_run SET finished_at = ?, outcome = ?, error = ? WHERE id = ?`).run(
     instant(clock),
     error === null ? "ok" : "error",
@@ -33,8 +39,8 @@ const runRow = z.object({
 });
 export type RunRow = z.infer<typeof runRow>;
 
-export function lastRun(db: Db, kind: RunKind): RunRow | undefined {
-  return one(
+export function getLastRun(db: DatabaseSync, kind: RunKind): RunRow | undefined {
+  return parseRow(
     runRow,
     db
       .prepare(
@@ -45,8 +51,8 @@ export function lastRun(db: Db, kind: RunKind): RunRow | undefined {
   );
 }
 
-export function lastSuccess(db: Db, kind: RunKind): string | undefined {
-  return one(
+export function getLastSuccessAt(db: DatabaseSync, kind: RunKind): string | undefined {
+  return parseRow(
     z.object({ started_at: z.string() }),
     db
       .prepare(

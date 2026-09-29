@@ -1,6 +1,6 @@
 import { createHash, createPrivateKey, sign, type KeyObject } from "node:crypto";
 import { z } from "zod";
-import { AppError, categoryForHttpStatus } from "../errors.ts";
+import { AppError, categoryForHttpStatus, MAX_ERROR_BODY_CHARS } from "../errors.ts";
 import { minorDigitsOf, parseDecimalMinor } from "../shared/money.ts";
 import type { NewTransaction } from "./repo.ts";
 
@@ -21,15 +21,17 @@ export interface AuthorisedSession {
   }[];
 }
 
+export interface AuthorisationRequest {
+  aspsp: { name: string; country: string };
+  state: string;
+  validUntil: string;
+  redirectUrl: string;
+}
+
 /** Read-only account information. Payment initiation is deliberately absent. */
 export interface BankFeed {
   listAspsps(country: string): Promise<Aspsp[]>;
-  startAuthorisation(input: {
-    aspsp: { name: string; country: string };
-    state: string;
-    validUntil: string;
-    redirectUrl: string;
-  }): Promise<{ url: string }>;
+  startAuthorisation(request: AuthorisationRequest): Promise<{ url: string }>;
   createSession(code: string): Promise<AuthorisedSession>;
   bookedTransactions(
     accountUid: string,
@@ -37,6 +39,15 @@ export interface BankFeed {
     dateTo: string,
   ): Promise<NewTransaction[]>;
 }
+
+// Enable Banking accepts tokens living at most 24h; one hour is plenty for a single call.
+const JWT_LIFETIME_SECONDS = 3600;
+// Assumed when a bank does not state its maximum consent validity.
+const DEFAULT_CONSENT_SECONDS = 90 * 86_400;
+const REQUEST_TIMEOUT_MS = 30_000;
+// nova: page cap guards against a provider that never stops paginating; 50 pages is years of
+// household traffic.
+const MAX_TRANSACTION_PAGES = 50;
 
 // ---- JWT -----------------------------------------------------------------------------------
 
@@ -56,7 +67,7 @@ export function signJwt(appId: string, key: KeyObject, nowSeconds: number): stri
       iss: "enablebanking.com",
       aud: "api.enablebanking.com",
       iat: nowSeconds,
-      exp: nowSeconds + 3600,
+      exp: nowSeconds + JWT_LIFETIME_SECONDS,
     }),
   );
   const signature = sign("RSA-SHA256", Buffer.from(`${header}.${payload}`), key);
@@ -132,13 +143,9 @@ export function toTransactions(items: ProviderTransaction[]): NewTransaction[] {
     const currency = t.transaction_amount.currency.toUpperCase();
     const signed = parseDecimalMinor(t.transaction_amount.amount, minorDigitsOf(currency));
     if (signed === 0) continue;
-    const direction: "debit" | "credit" = t.credit_debit_indicator
-      ? t.credit_debit_indicator === "DBIT"
-        ? "debit"
-        : "credit"
-      : signed < 0
-        ? "debit"
-        : "credit";
+    // The indicator wins; without one, the sign of the amount decides.
+    const isDebit = t.credit_debit_indicator ? t.credit_debit_indicator === "DBIT" : signed < 0;
+    const direction = isDebit ? "debit" : "credit";
     const counterparty = (direction === "debit" ? t.creditor?.name : t.debtor?.name) ?? null;
     const remittance = (t.remittance_information ?? []).join(" | ");
 
@@ -189,21 +196,16 @@ export class EnableBankingClient implements BankFeed {
       .map((a) => ({
         name: a.name,
         country: a.country,
-        maxConsentSeconds: a.maximum_consent_validity ?? 90 * 86_400,
+        maxConsentSeconds: a.maximum_consent_validity ?? DEFAULT_CONSENT_SECONDS,
       }));
   }
 
-  async startAuthorisation(input: {
-    aspsp: { name: string; country: string };
-    state: string;
-    validUntil: string;
-    redirectUrl: string;
-  }): Promise<{ url: string }> {
+  async startAuthorisation(request: AuthorisationRequest): Promise<{ url: string }> {
     const body = await this.call("POST", "/auth", {
-      access: { valid_until: input.validUntil },
-      aspsp: input.aspsp,
-      state: input.state,
-      redirect_url: input.redirectUrl,
+      access: { valid_until: request.validUntil },
+      aspsp: request.aspsp,
+      state: request.state,
+      redirect_url: request.redirectUrl,
       psu_type: "personal",
     });
     return authResponse.parse(body);
@@ -230,9 +232,7 @@ export class EnableBankingClient implements BankFeed {
   ): Promise<NewTransaction[]> {
     const items: ProviderTransaction[] = [];
     let continuation: string | null | undefined;
-    // nova: page cap guards against a provider that never stops paginating; 50 pages is years of
-    // household traffic.
-    for (let page = 0; page < 50; page++) {
+    for (let page = 0; page < MAX_TRANSACTION_PAGES; page++) {
       const q = new URLSearchParams({
         date_from: dateFrom,
         date_to: dateTo,
@@ -249,7 +249,11 @@ export class EnableBankingClient implements BankFeed {
       continuation = body.continuation_key;
       if (!continuation) return toTransactions(items);
     }
-    throw new AppError("invalid", "BANK_PAGINATION_RUNAWAY", "More than 50 transaction pages");
+    throw new AppError(
+      "invalid",
+      "BANK_PAGINATION_RUNAWAY",
+      `More than ${MAX_TRANSACTION_PAGES} transaction pages`,
+    );
   }
 
   private async call(
@@ -266,7 +270,7 @@ export class EnableBankingClient implements BankFeed {
           ...(json === undefined ? {} : { "content-type": "application/json" }),
         },
         ...(json === undefined ? {} : { body: JSON.stringify(json) }),
-        signal: AbortSignal.timeout(30_000),
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
     } catch (err) {
       throw new AppError("transient", "BANK_UNREACHABLE", "Enable Banking unreachable", {
@@ -281,7 +285,7 @@ export class EnableBankingClient implements BankFeed {
       throw new AppError(
         reauth ? "reauth" : category,
         reauth ? "BANK_CONSENT_EXPIRED" : `BANK_HTTP_${res.status}`,
-        `Enable Banking ${method} ${pathAndQuery.split("?")[0] ?? ""} → ${res.status}: ${text.slice(0, 300)}`,
+        `Enable Banking ${method} ${pathAndQuery.split("?")[0] ?? ""} → ${res.status}: ${text.slice(0, MAX_ERROR_BODY_CHARS)}`,
       );
     }
     try {
