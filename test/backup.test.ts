@@ -1,12 +1,9 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { writeFileSync } from "node:fs";
 import path from "node:path";
 import { test } from "vitest";
 import { backup } from "../src/poll/backup.ts";
-import { memDb } from "./helpers.ts";
-
-const tempDir = () => mkdtempSync(path.join(tmpdir(), "szamlak-"));
+import { memDb, tempDir } from "./helpers.ts";
 
 test("a backup before any file was stored succeeds with the snapshot alone", async () => {
   const backupDir = tempDir();

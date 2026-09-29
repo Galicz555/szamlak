@@ -1,7 +1,9 @@
 import { copyFile, mkdir, readdir, rm } from "node:fs/promises";
 import path from "node:path";
 import { sql, type Kysely } from "kysely";
+import { FILES_DIR } from "../bills/inbound-items.ts";
 import type { Database } from "../db/schema.ts";
+import { errnoCodeOf } from "../shared/errors.ts";
 
 const SNAPSHOT_PREFIX = "szamlak-";
 
@@ -14,21 +16,21 @@ export async function backup(
   db: Kysely<Database>,
   opts: { dataDir: string; backupDir: string; today: string; keep: number },
 ): Promise<string> {
-  await mkdir(path.join(opts.backupDir, "files"), { recursive: true });
+  await mkdir(path.join(opts.backupDir, FILES_DIR), { recursive: true });
   const target = path.join(opts.backupDir, `${SNAPSHOT_PREFIX}${opts.today}.db`);
   await rm(target, { force: true });
   await sql`VACUUM INTO ${target}`.execute(db);
 
-  const filesDir = path.join(opts.dataDir, "files");
-  const have = new Set(await readdir(path.join(opts.backupDir, "files")));
+  const filesDir = path.join(opts.dataDir, FILES_DIR);
+  const have = new Set(await readdir(path.join(opts.backupDir, FILES_DIR)));
   // No files directory yet means nothing to copy; any other error fails the backup.
   const source = await readdir(filesDir).catch((err: unknown) => {
-    if (err instanceof Error && "code" in err && err.code === "ENOENT") return [];
+    if (errnoCodeOf(err) === "ENOENT") return [];
     throw err;
   });
   for (const name of source) {
     if (!have.has(name))
-      await copyFile(path.join(filesDir, name), path.join(opts.backupDir, "files", name));
+      await copyFile(path.join(filesDir, name), path.join(opts.backupDir, FILES_DIR, name));
   }
 
   const snapshots = await listSnapshots(opts.backupDir);

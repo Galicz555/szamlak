@@ -1,47 +1,30 @@
-import { createHash, createPrivateKey, sign, type KeyObject } from "node:crypto";
+import type { KeyObject } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { z } from "zod";
-import { AppError, categoryForHttpStatus, MAX_ERROR_BODY_CHARS } from "../errors.ts";
-import { minorDigitsOf, parseDecimalMinor } from "../shared/money.ts";
-import type { NewTransaction } from "./repo.ts";
+import type { Env } from "../env.ts";
+import { AppError, categoryForHttpStatus, MAX_ERROR_BODY_CHARS } from "../shared/errors.ts";
+import { parseJson } from "../shared/json.ts";
+import type { Clock } from "../shared/time.ts";
+import type { Aspsp, AuthorisationRequest, AuthorisedSession, BankFeed } from "./feed.ts";
+import { loadPrivateKey, signJwt } from "./jwt.ts";
+import {
+  transactionsResponse,
+  toTransactions,
+  type ProviderTransaction,
+} from "./provider-transactions.ts";
+import type { NewTransaction } from "./transactions.ts";
 
-export interface Aspsp {
-  name: string;
-  country: string;
-  maxConsentSeconds: number;
+// The consent flow always starts on Enable Banking's own pages; anything else is refused.
+const BANK_LOGIN_HOST = "enablebanking.com";
+
+/** Is this an https address on Enable Banking's own domain (or a subdomain of it)? */
+export function isBankLoginUrl(url: string): boolean {
+  const host = new URL(url).hostname;
+  return (
+    url.startsWith("https://") && (host === BANK_LOGIN_HOST || host.endsWith(`.${BANK_LOGIN_HOST}`))
+  );
 }
 
-export interface AuthorisedSession {
-  sessionId: string;
-  validUntil: string;
-  accounts: {
-    uid: string;
-    iban: string | null;
-    name: string | null;
-    currency: string | null;
-  }[];
-}
-
-export interface AuthorisationRequest {
-  aspsp: { name: string; country: string };
-  state: string;
-  validUntil: string;
-  redirectUrl: string;
-}
-
-/** Read-only account information. Payment initiation is deliberately absent. */
-export interface BankFeed {
-  listAspsps(country: string): Promise<Aspsp[]>;
-  startAuthorisation(request: AuthorisationRequest): Promise<{ url: string }>;
-  createSession(code: string): Promise<AuthorisedSession>;
-  bookedTransactions(
-    accountUid: string,
-    dateFrom: string,
-    dateTo: string,
-  ): Promise<NewTransaction[]>;
-}
-
-// Enable Banking accepts tokens living at most 24h; one hour is plenty for a single call.
-const JWT_LIFETIME_SECONDS = 3600;
 // Assumed when a bank does not state its maximum consent validity.
 const DEFAULT_CONSENT_SECONDS = 90 * 86_400;
 const REQUEST_TIMEOUT_MS = 30_000;
@@ -49,33 +32,7 @@ const REQUEST_TIMEOUT_MS = 30_000;
 // household traffic.
 const MAX_TRANSACTION_PAGES = 50;
 
-// ---- JWT -----------------------------------------------------------------------------------
-
-export function loadPrivateKey(pem: string): KeyObject {
-  const key = createPrivateKey(pem);
-  if (key.asymmetricKeyType !== "rsa") throw new Error("Enable Banking key must be an RSA key");
-  return key;
-}
-
-const b64url = (data: string | Buffer): string => Buffer.from(data).toString("base64url");
-
-/** RS256 token, as Enable Banking requires: kid = application id, lifetime at most 24h. */
-export function signJwt(appId: string, key: KeyObject, nowSeconds: number): string {
-  const header = b64url(JSON.stringify({ typ: "JWT", alg: "RS256", kid: appId }));
-  const payload = b64url(
-    JSON.stringify({
-      iss: "enablebanking.com",
-      aud: "api.enablebanking.com",
-      iat: nowSeconds,
-      exp: nowSeconds + JWT_LIFETIME_SECONDS,
-    }),
-  );
-  const signature = sign("RSA-SHA256", Buffer.from(`${header}.${payload}`), key);
-  return `${header}.${payload}.${b64url(signature)}`;
-}
-
-// ---- response contracts (non-strict: the sender adds fields freely) --------------------------
-
+// Non-strict on purpose: the sender adds fields freely.
 const aspspsResponse = z.object({
   aspsps: z.array(
     z.object({
@@ -101,79 +58,6 @@ const sessionResponse = z.object({
     }),
   ),
 });
-
-const party = z.object({ name: z.string().nullish() }).nullish();
-
-const transactionSchema = z.object({
-  entry_reference: z.string().nullish(),
-  transaction_id: z.string().nullish(),
-  transaction_amount: z.object({ amount: z.string(), currency: z.string().length(3) }),
-  credit_debit_indicator: z.enum(["CRDT", "DBIT"]).nullish(),
-  status: z.string().nullish(),
-  booking_date: z.iso.date().nullish(),
-  value_date: z.iso.date().nullish(),
-  remittance_information: z.array(z.string()).nullish(),
-  creditor: party,
-  debtor: party,
-});
-type ProviderTransaction = z.infer<typeof transactionSchema>;
-
-const transactionsResponse = z.object({
-  transactions: z.array(transactionSchema),
-  continuation_key: z.string().nullish(),
-});
-
-// ---- mapping -------------------------------------------------------------------------------
-
-/**
- * Provider transaction → our row. The bank's own reference is the key when it gives one;
- * otherwise a content hash plus the occurrence index, so two identical same-day card
- * payments stay two rows.
- * nova: the index assumes the bank lists identical entries in a stable order across fetches;
- * revisit if a hashed-key account ever shows duplicates or gaps.
- */
-export function toTransactions(items: ProviderTransaction[]): NewTransaction[] {
-  const seen = new Map<string, number>();
-  const out: NewTransaction[] = [];
-  for (const t of items) {
-    if (t.status && t.status !== "BOOK") continue;
-    const bookingDate = t.booking_date ?? t.value_date;
-    if (!bookingDate) continue;
-
-    const currency = t.transaction_amount.currency.toUpperCase();
-    const signed = parseDecimalMinor(t.transaction_amount.amount, minorDigitsOf(currency));
-    if (signed === 0) continue;
-    // The indicator wins; without one, the sign of the amount decides.
-    const isDebit = t.credit_debit_indicator ? t.credit_debit_indicator === "DBIT" : signed < 0;
-    const direction = isDebit ? "debit" : "credit";
-    const counterparty = (direction === "debit" ? t.creditor?.name : t.debtor?.name) ?? null;
-    const remittance = (t.remittance_information ?? []).join(" | ");
-
-    let key = t.entry_reference ?? t.transaction_id ?? null;
-    if (!key) {
-      const hash = createHash("sha256")
-        .update(
-          JSON.stringify([bookingDate, signed, currency, direction, remittance, counterparty]),
-        )
-        .digest("hex");
-      const n = seen.get(hash) ?? 0;
-      seen.set(hash, n + 1);
-      key = `h:${hash}:${n}`;
-    }
-    out.push({
-      providerTxKey: key,
-      direction,
-      amountMinor: Math.abs(signed),
-      currency,
-      bookingDate,
-      counterparty,
-      remittance,
-    });
-  }
-  return out;
-}
-
-// ---- client --------------------------------------------------------------------------------
 
 export class EnableBankingClient implements BankFeed {
   private readonly baseUrl: string;
@@ -288,12 +172,22 @@ export class EnableBankingClient implements BankFeed {
         `Enable Banking ${method} ${pathAndQuery.split("?")[0] ?? ""} → ${res.status}: ${text.slice(0, MAX_ERROR_BODY_CHARS)}`,
       );
     }
-    try {
-      return JSON.parse(text) as unknown;
-    } catch (err) {
-      throw new AppError("invalid", "BANK_BAD_JSON", "Enable Banking answered non-JSON", {
-        cause: err,
-      });
-    }
+    return parseJson(text, { code: "BANK_BAD_JSON", message: "Enable Banking answered non-JSON" });
   }
+}
+
+/**
+ * The bank feed the configuration describes. Reads the private key file now, so a missing or
+ * non-RSA key stops the start-up instead of the first bank call.
+ */
+export function createBankFeed(
+  env: Pick<Env, "EB_API_URL" | "EB_APP_ID" | "EB_PRIVATE_KEY_PATH">,
+  clock: Clock,
+): BankFeed {
+  return new EnableBankingClient({
+    baseUrl: env.EB_API_URL,
+    appId: env.EB_APP_ID,
+    key: loadPrivateKey(readFileSync(env.EB_PRIVATE_KEY_PATH, "utf8")),
+    nowSeconds: () => Math.floor(clock.now().getTime() / 1000),
+  });
 }

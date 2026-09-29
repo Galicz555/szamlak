@@ -1,20 +1,27 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { request } from "node:http";
-import { tmpdir } from "node:os";
 import path from "node:path";
 import { sql, type Kysely } from "kysely";
-import { test } from "vitest";
 import type { Logger } from "pino";
-import type { BankFeed } from "../src/bank/enable-banking.ts";
-import { saveOauthState } from "../src/bank/repo.ts";
-import { insertInboundItem } from "../src/bills/repo.ts";
+import { test } from "vitest";
+import type { BankFeed } from "../src/bank/feed.ts";
+import { saveOauthState } from "../src/bank/oauth-state.ts";
+import { insertInboundItem } from "../src/bills/inbound-items.ts";
 import type { Database } from "../src/db/schema.ts";
 import { Poller } from "../src/poll/poller.ts";
-import { createWebServer, type WebDeps } from "../src/web/server.ts";
-import { capturingLog, fixedClock, memDb, silentLog } from "./helpers.ts";
-
-const unexpected = () => Promise.reject(new Error("unexpected call"));
+import { type WebDeps } from "../src/web/deps.ts";
+import { createWebServer } from "../src/web/server.ts";
+import {
+  capturingLog,
+  fixedClock,
+  inboundItem,
+  memDb,
+  silentLog,
+  tempDir,
+  unexpected,
+  unusedFeed,
+} from "./helpers.ts";
 
 // Written out, not imported: weakening the policy in the code must fail this test.
 const EXPECTED_HTML_HEADERS = {
@@ -23,13 +30,6 @@ const EXPECTED_HTML_HEADERS = {
   "x-content-type-options": "nosniff",
   "referrer-policy": "no-referrer",
   "cache-control": "no-store",
-};
-
-const unusedFeed: BankFeed = {
-  listAspsps: unexpected,
-  startAuthorisation: unexpected,
-  createSession: unexpected,
-  bookedTransactions: unexpected,
 };
 
 /** Serves the app on a free loopback port; `origin` is what the Host/Origin guard accepts. */
@@ -90,18 +90,11 @@ async function startServer(
 
 /** Queues one inbound item pointing at `filePath` (relative to the data dir); returns its id. */
 async function queueItem(db: Kysely<Database>, filePath: string): Promise<string> {
-  await insertInboundItem(db, fixedClock("2026-09-20T10:00:00Z"), {
-    contentSha256: filePath,
-    kind: "pdf",
-    mailbox: "INBOX",
-    uidValidity: "1",
-    uid: 1,
-    sender: "szamla@mvm.hu",
-    senderDomain: "mvm.hu",
-    subject: "Számla",
-    receivedAt: "2026-09-20T08:00:00Z",
-    filePath,
-  });
+  await insertInboundItem(
+    db,
+    fixedClock("2026-09-20T10:00:00Z"),
+    inboundItem({ contentSha256: filePath, filePath }),
+  );
   const row = await db
     .selectFrom("inbound_item")
     .select("id")
@@ -136,7 +129,7 @@ test("a bank login address outside Enable Banking is refused, not redirected to"
 
 test("a stored file that is gone is a 404; one that cannot be read is a logged 500", async () => {
   const db = memDb();
-  const dataDir = mkdtempSync(path.join(tmpdir(), "szamlak-"));
+  const dataDir = tempDir();
   // "blocker" is a file, so opening a path below it fails with ENOTDIR.
   writeFileSync(path.join(dataDir, "blocker"), "");
   const missing = await queueItem(db, "files/missing.pdf");
@@ -163,7 +156,7 @@ test("a stored file that is gone is a 404; one that cannot be read is a logged 5
 
 test("a read error after the headers went out aborts the download instead of completing it", async () => {
   const db = memDb();
-  const dataDir = mkdtempSync(path.join(tmpdir(), "szamlak-"));
+  const dataDir = tempDir();
   // A directory opens fine and fails on the first read (EISDIR), after the 200 is written.
   mkdirSync(path.join(dataDir, "files", "dir.pdf"), { recursive: true });
   const id = await queueItem(db, "files/dir.pdf");
@@ -182,7 +175,7 @@ test("a read error after the headers went out aborts the download instead of com
 
 test("every HTML answer carries the security headers, and a download keeps its own sandbox", async () => {
   const db = memDb();
-  const dataDir = mkdtempSync(path.join(tmpdir(), "szamlak-"));
+  const dataDir = tempDir();
   mkdirSync(path.join(dataDir, "files"));
   writeFileSync(path.join(dataDir, "files", "body.txt"), "text");
   const id = await queueItem(db, "files/body.txt");

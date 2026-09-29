@@ -2,13 +2,15 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { sql, type Kysely } from "kysely";
 import { test } from "vitest";
-import { insertTransactions, saveSession, listUnmatchedDebits } from "../src/bank/repo.ts";
+import { saveSession } from "../src/bank/accounts.ts";
+import { insertTransactions, listUnmatchedDebits } from "../src/bank/transactions.ts";
+import { insertInboundItem } from "../src/bills/inbound-items.ts";
+import { getBill, insertBill, listActiveBills } from "../src/bills/repo.ts";
 import type { Database } from "../src/db/schema.ts";
-import { getBill, insertBill, insertInboundItem, listActiveBills } from "../src/bills/repo.ts";
-import { categoryOf } from "../src/errors.ts";
 import { candidatesFor, decide, type MatchBill, type MatchTx } from "../src/match/engine.ts";
 import { confirmMatch, listCandidates, revokeMatch, runAutoMatch } from "../src/match/matching.ts";
-import { fixedClock, memDb } from "./helpers.ts";
+import { categoryOf } from "../src/shared/errors.ts";
+import { fixedClock, inboundItem, memDb } from "./helpers.ts";
 
 const bill: MatchBill = {
   id: "b1",
@@ -80,18 +82,15 @@ test("wrong currency, wrong amount or outside the window is not a candidate", ()
 async function seed(db: Kysely<Database>, clock: ReturnType<typeof fixedClock>): Promise<void> {
   const addBill = async (invoice: string, due: string, issue: string) => {
     const sha = randomUUID();
-    await insertInboundItem(db, clock, {
-      contentSha256: sha,
-      kind: "pdf",
-      mailbox: "INBOX",
-      uidValidity: "1",
-      uid: 1,
-      sender: "szamla@telekom.hu",
-      senderDomain: "telekom.hu",
-      subject: "Számla",
-      receivedAt: clock.now().toISOString(),
-      filePath: `files/${sha}.pdf`,
-    });
+    await insertInboundItem(
+      db,
+      clock,
+      inboundItem({
+        contentSha256: sha,
+        receivedAt: clock.now().toISOString(),
+        filePath: `files/${sha}.pdf`,
+      }),
+    );
     const item = await db
       .selectFrom("inbound_item")
       .select("id")

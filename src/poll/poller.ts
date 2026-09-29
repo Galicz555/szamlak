@@ -1,17 +1,18 @@
 import type { Kysely } from "kysely";
 import type { Logger } from "pino";
-import type { BankFeed } from "../bank/enable-banking.ts";
-import { syncBank, type BankSyncSettings } from "../bank/sync.ts";
+import type { BankFeed } from "../bank/feed.ts";
+import { syncBank } from "../bank/sync.ts";
 import type { Database } from "../db/schema.ts";
-import type { BillExtractor } from "../extract/extractors.ts";
-import { processQueue, type ExtractSettings } from "../extract/process.ts";
-import { errorText } from "../log.ts";
-import { ingestMail, type MailSettings } from "../mail/ingest.ts";
+import type { BillExtractor } from "../extract/extractor.ts";
+import { processQueue } from "../extract/process.ts";
+import { ingestMail } from "../mail/ingest.ts";
 import type { Mailbox } from "../mail/mailbox.ts";
 import { runAutoMatch } from "../match/matching.ts";
+import { errorText } from "../shared/log.ts";
 import { todayIn, type Clock } from "../shared/time.ts";
 import { backup } from "./backup.ts";
 import { finishRun, getLastSuccessAt, startRun, type RunKind } from "./runs.ts";
+import type { PollerSettings } from "./settings.ts";
 
 export interface PollerDeps {
   db: Kysely<Database>;
@@ -20,14 +21,6 @@ export interface PollerDeps {
   mailbox: Mailbox;
   extractor: BillExtractor;
   feed: BankFeed;
-}
-
-/** What each stage needs, per stage. */
-export interface PollerSettings {
-  mail: MailSettings;
-  extract: ExtractSettings;
-  bank: BankSyncSettings & { pollHours: number };
-  backup: { enabled: boolean; dataDir: string; backupDir: string; keep: number; timeZone: string };
 }
 
 /*
@@ -131,4 +124,14 @@ export class Poller {
     const today = todayIn(this.deps.clock, timeZone);
     return !last || todayIn({ now: () => new Date(last) }, timeZone) !== today;
   }
+}
+
+// nova: the scheduler lives in the web process (a deviation recorded in docs/assumptions.md);
+// move it to a worker process when a second process exists.
+/** Triggers a pass every `everyMinutes` minutes; returns the timer that stops it. */
+export function schedulePolling(
+  poller: Poller,
+  { everyMinutes }: { everyMinutes: number },
+): NodeJS.Timeout {
+  return setInterval(() => void poller.trigger(), everyMinutes * 60_000);
 }

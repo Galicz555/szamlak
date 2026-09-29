@@ -40,3 +40,14 @@ export function addDays(date: CalendarDate, days: number): CalendarDate {
 export function instant(clock: Clock): string {
   return clock.now().toISOString();
 }
+
+/** A stored instant as the UI shows it: Hungarian short date and time in `timeZone`. */
+export const formatInstant = (iso: string, timeZone: string): string =>
+  new Intl.DateTimeFormat("hu-HU", { dateStyle: "short", timeStyle: "short", timeZone }).format(
+    new Date(iso),
+  );
+
+/** Throws (a RangeError) unless `timeZone` is a zone the runtime knows. */
+export function assertKnownTimeZone(timeZone: string): void {
+  new Intl.DateTimeFormat("en-CA", { timeZone });
+}

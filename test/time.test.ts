@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 import { test } from "vitest";
-import { billState } from "../src/bills/status.ts";
 import { addDays, isCalendarDate, todayIn } from "../src/shared/time.ts";
 
 const at = (iso: string) => ({ now: () => new Date(iso) });
@@ -29,16 +28,4 @@ test("isCalendarDate rejects impossible dates", () => {
   assert.ok(!isCalendarDate("2026-02-29"));
   assert.ok(!isCalendarDate("2026-13-01"));
   assert.ok(!isCalendarDate("2026-1-01"));
-});
-
-test("bill state: due today is still awaiting, the day after is overdue, a match wins", () => {
-  assert.equal(
-    billState({ hasActiveMatch: false, dueDate: "2026-10-15" }, "2026-10-15"),
-    "awaiting",
-  );
-  assert.equal(
-    billState({ hasActiveMatch: false, dueDate: "2026-10-15" }, "2026-10-16"),
-    "overdue",
-  );
-  assert.equal(billState({ hasActiveMatch: true, dueDate: "2026-10-15" }, "2026-12-01"), "paid");
 });

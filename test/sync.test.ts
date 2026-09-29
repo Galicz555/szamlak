@@ -1,12 +1,11 @@
 import assert from "node:assert/strict";
 import { sql } from "kysely";
 import { test } from "vitest";
-import type { BankFeed } from "../src/bank/enable-banking.ts";
-import { saveSession, type NewTransaction } from "../src/bank/repo.ts";
+import { saveSession } from "../src/bank/accounts.ts";
+import type { BankFeed } from "../src/bank/feed.ts";
 import { syncBank } from "../src/bank/sync.ts";
-import { fixedClock, memDb, silentLog } from "./helpers.ts";
-
-const unexpected = () => Promise.reject(new Error("unexpected call"));
+import { type NewTransaction } from "../src/bank/transactions.ts";
+import { fixedClock, memDb, silentLog, unusedFeed } from "./helpers.ts";
 
 const booked = (key: string): NewTransaction => ({
   providerTxKey: key,
@@ -33,9 +32,7 @@ test("one account's fetch is stored whole or not at all", async () => {
     }),
   );
   const feed: BankFeed = {
-    listAspsps: unexpected,
-    startAuthorisation: unexpected,
-    createSession: unexpected,
+    ...unusedFeed,
     bookedTransactions: () => Promise.resolve([booked("t1"), booked("t2")]),
   };
   // The second row of the fetch fails: the first must not be stored on its own.

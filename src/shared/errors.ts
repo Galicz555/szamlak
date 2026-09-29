@@ -37,3 +37,10 @@ export function categoryOf(err: unknown): ErrorCategory {
 export function codeOf(err: unknown): string {
   return err instanceof AppError ? err.code : "UNEXPECTED";
 }
+
+/** The string `code` of an Error that has one: Node's system errors carry `ENOENT`, `EEXIST`, … */
+export function errnoCodeOf(err: unknown): string | undefined {
+  return err instanceof Error && "code" in err && typeof err.code === "string"
+    ? err.code
+    : undefined;
+}

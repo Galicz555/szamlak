@@ -11,9 +11,3 @@ export function billState(
   // Due on the day itself is not yet overdue. ISO dates compare correctly as strings.
   return bill.dueDate < today ? "overdue" : "awaiting";
 }
-
-export const BILL_STATE_LABELS: Readonly<Record<BillState, string>> = {
-  paid: "Fizetve",
-  awaiting: "Fizetésre vár",
-  overdue: "Lejárt",
-};

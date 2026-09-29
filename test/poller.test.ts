@@ -1,32 +1,30 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readdirSync } from "node:fs";
-import { tmpdir } from "node:os";
-import path from "node:path";
+import { readdirSync } from "node:fs";
 import { sql, type Kysely } from "kysely";
-import { test } from "vitest";
 import type { Logger } from "pino";
-import type { BankFeed } from "../src/bank/enable-banking.ts";
+import { test } from "vitest";
 import type { Database } from "../src/db/schema.ts";
-import type { BillExtractor } from "../src/extract/extractors.ts";
+import type { BillExtractor } from "../src/extract/extractor.ts";
 import type { Mailbox } from "../src/mail/mailbox.ts";
 import { Poller } from "../src/poll/poller.ts";
 import type { Clock } from "../src/shared/time.ts";
-import { capturingLog, fixedClock, memDb, silentLog } from "./helpers.ts";
+import {
+  capturingLog,
+  fixedClock,
+  memDb,
+  silentLog,
+  tempDir,
+  unexpected,
+  unusedFeed,
+} from "./helpers.ts";
 
 const TIME_ZONE = "Europe/Budapest";
 
 const emptyMailbox: Mailbox = {
   fetchNew: () => Promise.resolve({ mailbox: "INBOX", uidValidity: "1", messages: [] }),
 };
-const unexpected = () => Promise.reject(new Error("unexpected call"));
 const unusedExtractor: BillExtractor = { name: "unused", extract: unexpected };
 // No bank account is connected, so a bank stage succeeds without calling the feed.
-const unusedFeed: BankFeed = {
-  listAspsps: unexpected,
-  startAuthorisation: unexpected,
-  createSession: unexpected,
-  bookedTransactions: unexpected,
-};
 
 function makePoller(
   db: Kysely<Database>,
@@ -38,8 +36,8 @@ function makePoller(
     log = silentLog,
   }: { mailbox?: Mailbox; backupEnabled?: boolean; backupTimeZone?: string; log?: Logger } = {},
 ): { poller: Poller; backupDir: string } {
-  const dataDir = mkdtempSync(path.join(tmpdir(), "szamlak-"));
-  const backupDir = mkdtempSync(path.join(tmpdir(), "szamlak-backup-"));
+  const dataDir = tempDir();
+  const backupDir = tempDir("szamlak-backup-");
   const poller = new Poller(
     { db, clock, log, mailbox, extractor: unusedExtractor, feed: unusedFeed },
     {

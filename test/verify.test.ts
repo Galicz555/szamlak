@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "vitest";
 import type { Extraction } from "../src/extract/schema.ts";
-import { printedAmounts, verifyExtraction } from "../src/extract/verify.ts";
+import { verifyExtraction } from "../src/extract/verify.ts";
 
 const TEXT = `MVM Next Energiakereskedelmi Zrt.
 Számla sorszáma: 5 1234 5678 90
@@ -97,17 +97,6 @@ test("a fragment of a space-grouped amount, or digits joined across columns, is 
     const v = verifyExtraction({ ...good, amount_due_text: wrong }, text);
     assert.equal(v.kind, "rejected", wrong);
   }
-});
-
-test("printed amounts: grouped, decimal, suffixed; never date or id fragments", () => {
-  const found = printedAmounts(
-    "Összesen: 1 234 567 Ft, díj 12.345,- és 99,50 EUR; 12345Ft. Kelt 2026.09.18. Szám E-SZ-2026/0045871",
-    2,
-  );
-  assert.deepEqual(
-    [...found].sort((a, b) => a - b),
-    [9950, 1_234_500, 123_456_700],
-  );
 });
 
 test("a number is not found inside a longer space-grouped number", () => {

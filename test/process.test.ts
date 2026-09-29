@@ -1,20 +1,16 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { writeFileSync } from "node:fs";
 import path from "node:path";
 import { sql, type Kysely } from "kysely";
 import { test } from "vitest";
-import {
-  listDeadLetteredInboundItems,
-  insertInboundItem,
-  listActiveBills,
-} from "../src/bills/repo.ts";
+import { listDeadLetteredInboundItems, insertInboundItem } from "../src/bills/inbound-items.ts";
+import { listActiveBills } from "../src/bills/repo.ts";
 import type { Database } from "../src/db/schema.ts";
-import { AppError } from "../src/errors.ts";
-import type { BillExtractor } from "../src/extract/extractors.ts";
+import type { BillExtractor } from "../src/extract/extractor.ts";
 import { processQueue } from "../src/extract/process.ts";
 import type { Extraction } from "../src/extract/schema.ts";
-import { fixedClock, memDb, scripted, silentLog } from "./helpers.ts";
+import { AppError } from "../src/shared/errors.ts";
+import { fixedClock, inboundItem, memDb, scripted, silentLog, tempDir } from "./helpers.ts";
 
 const TEXT = `Magyar Telekom Nyrt.
 Számlaszám: 123-456-789
@@ -53,20 +49,13 @@ async function queueOne(
   db: Kysely<Database>,
   clock: ReturnType<typeof fixedClock>,
 ): Promise<string> {
-  const dir = mkdtempSync(path.join(tmpdir(), "szamlak-"));
+  const dir = tempDir();
   writeFileSync(path.join(dir, "body.txt"), TEXT);
-  await insertInboundItem(db, clock, {
-    contentSha256: "sha-1",
-    kind: "body",
-    mailbox: "INBOX",
-    uidValidity: "1",
-    uid: 7,
-    sender: "szamla@telekom.hu",
-    senderDomain: "telekom.hu",
-    subject: "Számla",
-    receivedAt: "2026-09-20T08:00:00Z",
-    filePath: "body.txt",
-  });
+  await insertInboundItem(
+    db,
+    clock,
+    inboundItem({ contentSha256: "sha-1", kind: "body", uid: 7, filePath: "body.txt" }),
+  );
   return dir;
 }
 
@@ -82,18 +71,18 @@ test("a verified extraction becomes a bill; the same invoice again is a duplicat
   assert.equal(bill?.amount_minor, 899_000);
 
   // The same bill again, in another message (a reminder with a re-rendered PDF).
-  await insertInboundItem(db, clock, {
-    contentSha256: "sha-2",
-    kind: "body",
-    mailbox: "INBOX",
-    uidValidity: "1",
-    uid: 8,
-    sender: "szamla@telekom.hu",
-    senderDomain: "telekom.hu",
-    subject: "Emlékeztető",
-    receivedAt: "2026-09-21T08:00:00Z",
-    filePath: "body.txt",
-  });
+  await insertInboundItem(
+    db,
+    clock,
+    inboundItem({
+      contentSha256: "sha-2",
+      kind: "body",
+      uid: 8,
+      subject: "Emlékeztető",
+      receivedAt: "2026-09-21T08:00:00Z",
+      filePath: "body.txt",
+    }),
+  );
   assert.deepEqual(await processQueue(deps, { dataDir, maxAttempts: 3 }), { done: 1, failed: 0 });
   assert.equal((await listActiveBills(db)).length, 1);
   const results = await db

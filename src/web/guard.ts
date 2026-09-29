@@ -30,22 +30,3 @@ export function guardRequest(
     ? { ok: true }
     : { ok: false, status: 403, reason: "missing Origin" };
 }
-
-export const HTML_SECURITY_HEADERS: Readonly<Record<string, string>> = {
-  "content-security-policy":
-    "default-src 'none'; style-src 'self'; img-src 'self'; form-action 'self' https://*.enablebanking.com; frame-ancestors 'none'; base-uri 'none'",
-  "x-content-type-options": "nosniff",
-  "referrer-policy": "no-referrer",
-  "cache-control": "no-store",
-};
-
-// The consent flow always starts on Enable Banking's own pages; anything else is refused.
-const BANK_LOGIN_HOST = "enablebanking.com";
-
-/** Is this an https address on Enable Banking's own domain (or a subdomain of it)? */
-export function isBankLoginUrl(url: string): boolean {
-  const host = new URL(url).hostname;
-  return (
-    url.startsWith("https://") && (host === BANK_LOGIN_HOST || host.endsWith(`.${BANK_LOGIN_HOST}`))
-  );
-}

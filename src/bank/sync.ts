@@ -1,11 +1,12 @@
-import type { Logger } from "pino";
 import type { Kysely } from "kysely";
+import type { Logger } from "pino";
 import type { Database } from "../db/schema.ts";
-import { AppError } from "../errors.ts";
-import { errorText } from "../log.ts";
+import { AppError } from "../shared/errors.ts";
+import { errorText } from "../shared/log.ts";
 import { addDays, instant, todayIn, type Clock } from "../shared/time.ts";
-import type { BankFeed } from "./enable-banking.ts";
-import { insertTransactions, listAccounts } from "./repo.ts";
+import { listAccounts } from "./accounts.ts";
+import type { BankFeed } from "./feed.ts";
+import { insertTransactions } from "./transactions.ts";
 
 export interface BankSyncDeps {
   db: Kysely<Database>;

@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { AppError } from "../errors.ts";
+import { AppError } from "../shared/errors.ts";
 
 const execFileAsync = promisify(execFile);
 

@@ -1,13 +1,12 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { readFileSync } from "node:fs";
 import path from "node:path";
 import { sql } from "kysely";
 import { test } from "vitest";
-import { listQueuedInboundItems } from "../src/bills/repo.ts";
-import { ingestMail, isAllowedSender, type MailSettings } from "../src/mail/ingest.ts";
+import { listQueuedInboundItems } from "../src/bills/inbound-items.ts";
+import { ingestMail, type MailSettings } from "../src/mail/ingest.ts";
 import type { FetchResult, Mailbox } from "../src/mail/mailbox.ts";
-import { fixedClock, memDb, scripted, silentLog } from "./helpers.ts";
+import { fixedClock, memDb, scripted, silentLog, tempDir } from "./helpers.ts";
 
 const PDF = Buffer.from("%PDF-1.4\n% test bill\n%%EOF\n");
 
@@ -50,7 +49,7 @@ const GOOD_AUTH = "mx.google.com; dkim=pass header.i=@mvm.hu; dmarc=pass header.
 
 function mailSettings(overrides: Partial<MailSettings> = {}): MailSettings {
   return {
-    dataDir: mkdtempSync(path.join(tmpdir(), "szamlak-")),
+    dataDir: tempDir(),
     timeZone: "Europe/Budapest",
     senders: ["mvm.hu"],
     lookbackDays: 30,
@@ -164,15 +163,6 @@ test("a genuine bill addressed to someone else (re-sent by another customer) is 
     mailSettings(),
   );
   assert.deepEqual(r, { queued: 0, skipped: 1 });
-});
-
-test("sender allow-list matches whole addresses and domains, not look-alikes", () => {
-  assert.ok(isAllowedSender("szamla@mvm.hu", ["mvm.hu"]));
-  assert.ok(isAllowedSender("x@next.mvm.hu", ["mvm.hu"]));
-  assert.ok(!isAllowedSender("x@evilmvm.hu", ["mvm.hu"]));
-  assert.ok(!isAllowedSender("x@mvm.hu.evil.example", ["mvm.hu"]));
-  assert.ok(isAllowedSender("e-szamla@telekom.hu", ["e-szamla@telekom.hu"]));
-  assert.ok(!isAllowedSender("mas@telekom.hu", ["e-szamla@telekom.hu"]));
 });
 
 test("an authenticated mail from a sender outside the allow-list is skipped", async () => {

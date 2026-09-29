@@ -22,18 +22,20 @@ no `namespace`, no parameter properties. Relative imports carry the `.ts` extens
 
 ## Layout
 
-| Path           | What                                                                                                                        |
-| -------------- | --------------------------------------------------------------------------------------------------------------------------- |
-| `src/env.ts`   | The only reader of `process.env`; Zod-validated, no secret fallbacks                                                        |
-| `src/db/`      | `openDb`: better-sqlite3 + Kysely, SQL files in `migrations/` (`PRAGMA user_version`); the `Database` types in `schema.ts`  |
-| `src/mail/`    | `Mailbox` port + IMAP adapter, sender authentication, ingest into `inbound_item`                                            |
-| `src/extract/` | `BillExtractor` port (local OpenAI-compatible, Gemini), `pdftotext`, verification against the text, queue processing        |
-| `src/bank/`    | `BankFeed` port + Enable Banking client (RS256 JWT), repo, sync                                                             |
-| `src/match/`   | Pure scoring engine + the DB-side auto-match / confirm / revoke                                                             |
-| `src/bills/`   | Bill repo and the derived state                                                                                             |
-| `src/poll/`    | `Poller` (the background work card is in its header), run records, backup                                                   |
-| `src/web/`     | Hono on `@hono/node-server`; the Host/Origin guard and security headers as middleware; auto-escaping `html` template; pages |
-| `docs/`        | `assumptions.md` (deviations, thresholds, trust boundaries, secrets), `glossary.md`, `code-style.md`                        |
+| Path           | What                                                                                                                                                                                                              |
+| -------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `src/main.ts`  | The composition root: opens the database, builds and wires the pieces, starts them; `src/shutdown.ts` handles the signals                                                                                         |
+| `src/env.ts`   | The only reader of `process.env`; Zod-validated, no secret fallbacks                                                                                                                                              |
+| `src/shared/`  | Cross-cutting helpers no domain owns: calendar and clock (`time.ts`), money (`money.ts`), JSON parsing (`json.ts`), `AppError` and its categories (`errors.ts`), the logger (`log.ts`)                            |
+| `src/db/`      | `openDb`: better-sqlite3 + Kysely, SQL files in `migrations/` (`PRAGMA user_version`); the `Database` types in `schema.ts`                                                                                        |
+| `src/mail/`    | `Mailbox` port (`mailbox.ts`) + IMAP adapter (`imap-mailbox.ts`), sender authentication, admitting and storing one message (`message.ts`), the cursor, ingest into `inbound_item`                                 |
+| `src/extract/` | `BillExtractor` port (`extractor.ts`) + its adapters (`local-llm.ts` for any OpenAI-compatible server, `gemini.ts`), `pdftotext`, verification against the text (`text-search.ts`, `verify.ts`), queue processing |
+| `src/bank/`    | `BankFeed` port (`feed.ts`) + Enable Banking client (RS256 JWT in `jwt.ts`), repos for accounts, transactions and consent state, the consent flow (`consent.ts`), sync                                            |
+| `src/match/`   | Pure scoring engine + the DB-side auto-match / confirm / revoke                                                                                                                                                   |
+| `src/bills/`   | Bill repo, the inbound-item queue repo, and the derived state                                                                                                                                                     |
+| `src/poll/`    | `Poller` (the background work card is in its header), its settings from the environment, run records, backup                                                                                                      |
+| `src/web/`     | Hono on `@hono/node-server`: middleware (Host/Origin guard, security headers), `src/web/routes/` and `src/web/pages/` per domain, auto-escaping `html` template                                                   |
+| `docs/`        | `assumptions.md` (deviations, thresholds, trust boundaries, secrets), `glossary.md`, `code-style.md`                                                                                                              |
 
 ## Rules that are easy to break
 

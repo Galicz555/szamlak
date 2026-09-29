@@ -1,9 +1,9 @@
 import { randomUUID } from "node:crypto";
 import type { Kysely, Transaction } from "kysely";
-import { listUnmatchedDebits, type TransactionRow } from "../bank/repo.ts";
+import { getTransaction, listUnmatchedDebits, type TransactionRow } from "../bank/transactions.ts";
 import { getBill, listUnmatchedBills, type BillRow } from "../bills/repo.ts";
 import type { Database } from "../db/schema.ts";
-import { AppError } from "../errors.ts";
+import { AppError } from "../shared/errors.ts";
 import { instant, type Clock } from "../shared/time.ts";
 import {
   candidatesFor,
@@ -109,6 +109,20 @@ export async function listCandidates(db: Kysely<Database>, billId: string): Prom
   const mb = toMatchBill(bill);
   const { from, to } = searchWindow(mb);
   return candidatesFor(mb, (await listUnmatchedDebits(db, from, to)).map(toMatchTx));
+}
+
+/** The candidates for one bill together with the bank transaction each one refers to. */
+export async function listCandidatesWithTransactions(
+  db: Kysely<Database>,
+  billId: string,
+): Promise<{ candidate: Candidate; tx: TransactionRow }[]> {
+  const candidates = await listCandidates(db, billId);
+  const withTransactions = [];
+  for (const candidate of candidates) {
+    const tx = await getTransaction(db, candidate.transactionId);
+    if (tx) withTransactions.push({ candidate, tx });
+  }
+  return withTransactions;
 }
 
 /** A person confirms a suggestion. Only a current candidate can be confirmed. */

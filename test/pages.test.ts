@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "vitest";
-import type { InboundItem } from "../src/bills/repo.ts";
-import { inboxPage, layout, type StatusBar } from "../src/web/pages.ts";
+import type { InboundItem } from "../src/bills/inbound-items.ts";
+import { inboxPage } from "../src/web/pages/inbox.ts";
+import { layout, type StatusBar } from "../src/web/pages/layout.ts";
 
 // 22:30 UTC is already the next day in Budapest (UTC+2 in September).
 const LATE_EVENING_UTC = "2026-09-20T22:30:00Z";
