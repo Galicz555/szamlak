@@ -1,11 +1,39 @@
 # Számlák
 
-A local web app that shows which bills arrived, and whether each is **Fizetve**,
-**Fizetésre vár** or **Lejárt** — by reading the bills from Gmail and checking the payments
-against Erste and Revolut through Enable Banking (PSD2, read-only).
+A local web app that shows which bills arrived, and whether each is **Fizetve** (paid),
+**Fizetésre vár** (awaiting payment) or **Lejárt** (overdue) — by reading the bills from Gmail
+and checking the payments against Erste and Revolut through Enable Banking (PSD2, read-only).
+The UI is in Hungarian; code and docs are in English.
 
 It never pays, never sends, never changes the mailbox. It runs on your machine only
 (`127.0.0.1`).
+
+## How it works
+
+```
+Gmail (IMAP) → sender authentication → PDF text → LLM extraction → verification → bills
+Enable Banking (PSD2) → transactions ──────────────────────────────→ matching → paid / awaiting / overdue
+```
+
+- **Model output is untrusted input.** The extractor (any OpenAI-compatible local model, or
+  Gemini) returns JSON constrained by a schema; every field the app acts on must then be found
+  in the PDF text itself before the bill is accepted. `pnpm eval:extract` measures a model against
+  hand-labelled bills, and the bar is zero _accepted but wrong_ results, before acceptance rate.
+- **Validation at every boundary.** Zod parses the environment, IMAP metadata, model output,
+  bank API responses, form posts and JSON stored in the database; SQLite tables are `STRICT`,
+  and invariants live in the schema (UNIQUE / CHECK / partial indexes) before the code.
+- **Money and dates are exact.** Integer minor units plus currency, never floats; dates are
+  calendar days in the configured time zone.
+- **Small attack surface.** Bound to `127.0.0.1` with a Host/Origin guard and security headers;
+  anything from a mail, a PDF or the bank reaches HTML only through one escaping template that
+  is tested as a boundary. Read-only bank consent, no payment initiation.
+- **Ports and adapters.** Mailbox, extractor and bank feed are interfaces with one adapter each
+  (two for the extractor), wired in a single composition root (`src/main.ts`).
+- **Supply chain.** Dependencies need a 7-day minimum release age and none may run install
+  scripts; a `gitleaks` pre-commit hook refuses commits that carry secrets.
+
+Stack: TypeScript on Node 26 (type stripping, no build step), Hono, Kysely on better-sqlite3,
+Zod, Vitest.
 
 ## First run
 
