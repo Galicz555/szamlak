@@ -4,7 +4,7 @@ import path from "node:path";
 import type { Attachment, ParsedMail } from "mailparser";
 import { FILES_DIR, type NewInboundItem } from "../bills/inbound-items.ts";
 import { errnoCodeOf } from "../shared/errors.ts";
-import { isAddressedToUs, isSenderAuthenticated } from "./sender-auth.ts";
+import { isAddressedToUs, isSenderAuthenticated, isToSigned } from "./sender-auth.ts";
 
 /** What one message must carry for its queue items: everything but the stored content. */
 export type ItemHeader = Omit<NewInboundItem, "contentSha256" | "kind" | "filePath">;
@@ -13,7 +13,7 @@ export type ItemHeader = Omit<NewInboundItem, "contentSha256" | "kind" | "filePa
 export interface AdmissionRules {
   senders: string[];
   trustedAuthserv: string;
-  /** Our own addresses; a bill must be addressed to one of them. */
+  /** Our own addresses; a bill's single, DKIM-signed To must name one of them. */
   recipients: string[];
 }
 
@@ -29,13 +29,20 @@ export function isAllowedSender(address: string, senders: string[]): boolean {
   );
 }
 
-export type Refusal = "sender_not_allowed" | "sender_not_authenticated" | "not_addressed_to_us";
+export type Refusal =
+  | "sender_not_allowed"
+  | "sender_not_authenticated"
+  | "repeated_recipient_header"
+  | "not_addressed_to_us"
+  | "recipient_not_signed";
 
 // IMAP matches FROM by substring, so look-alike senders arrive routinely and are dropped quietly.
 export const REFUSAL_WARNINGS: Record<Refusal, string | null> = {
   sender_not_allowed: null,
   sender_not_authenticated: "sender not authenticated; message ignored",
+  repeated_recipient_header: "repeated To or Cc header; message ignored",
   not_addressed_to_us: "not addressed to us; message ignored",
+  recipient_not_signed: "To header not covered by a verified DKIM signature; message ignored",
 };
 
 export function toRefusal(
@@ -47,10 +54,19 @@ export function toRefusal(
   if (!isSenderAuthenticated(parsed.headerLines, senderDomain, rules.trustedAuthserv)) {
     return "sender_not_authenticated";
   }
-  const recipients = [parsed.to, parsed.cc]
+  // DKIM verifies only the bottom-most instance of a header, while the parser merges repeats:
+  // an extra To or Cc above the signed one would read as if it were signed.
+  const count = (name: string): number =>
+    parsed.headerLines.filter((h) => h.key.toLowerCase() === name).length;
+  if (count("to") > 1 || count("cc") > 1) return "repeated_recipient_header";
+  // Only To, and only when the verified signature covers it: signers often leave Cc unsigned.
+  const recipients = [parsed.to]
     .flatMap((a) => (a === undefined ? [] : Array.isArray(a) ? a : [a]))
     .flatMap((a) => a.value.map((v) => v.address ?? ""));
   if (!isAddressedToUs(recipients, rules.recipients)) return "not_addressed_to_us";
+  if (!isToSigned(parsed.headerLines, senderDomain, rules.trustedAuthserv)) {
+    return "recipient_not_signed";
+  }
   return null;
 }
 

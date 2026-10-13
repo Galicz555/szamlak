@@ -56,9 +56,24 @@ it never sends mail, never moves money, never changes the mailbox.
   topmost `Authentication-Results` header, written by our own provider, shows DKIM or DMARC
   alignment with the From domain. A forged bill carrying a stranger's IBAN never becomes a bill.
 - **A genuine bill is not necessarily ours.** Another customer can re-send their own DKIM-signed
-  MVM bill; it must be addressed (To/Cc, which DKIM signs) to one of `MAIL_RECIPIENTS`.
-  `MAIL_SENDERS` must never list a shared invoicing platform (szamlazz.hu, billingo.hu): every
-  customer of such a platform holds a valid signature for its domain.
+  MVM bill, and DKIM does not bind the recipient: it verifies only the bottom-most instance of
+  each signed header (RFC 6376 §5.4.2), many signers leave Cc out of `h=`, and the mail parser
+  merges repeated headers. So a message is admitted only if all of these hold:
+  - it has at most one `To` and at most one `Cc` header (counted in the raw header lines);
+  - that one `To` names an address in `MAIL_RECIPIENTS` (`Cc` is never read);
+  - a DKIM signature aligned with the From domain, which our provider reports as passed, lists
+    `to` in its `h=` tag. Authentication-Results names that signature only by `header.s` and the
+    start of `header.b`, so it is found among the `DKIM-Signature` headers by that pair; if any
+    header matching the pair omits `to`, the message is refused.
+
+  Limits: a DMARC pass that rests on SPF alone, or a signer that does not sign `To`, is refused
+  with the log warning "To header not covered by a verified DKIM signature"; the check is not
+  relaxed for such a supplier. The match by `header.b` prefix trusts that the
+  provider's verdict belongs to one of those headers, not that we re-verified the signature.
+  A bill Bcc'd to us (our address not in `To`) is refused. `MAIL_SENDERS` must never list a
+  shared invoicing platform (szamlazz.hu, billingo.hu): every customer of such a platform holds
+  a valid signature for its domain.
+
 - **The Authentication-Results header is parsed, not grepped.** Comments and quoted strings are
   removed before the `;` split, because Gmail repeats the sender-controlled envelope address in
   there. Open question: mail pulled in by Gmail's "Check mail from other accounts" (POP import)

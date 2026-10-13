@@ -16,9 +16,16 @@ function message(opts: {
   pdf?: Buffer;
   body?: string;
   to?: string;
+  /** Header lines a re-sender put above the signed ones. */
+  prepend?: string[];
+  /** The signed header list (`h=`) of the From domain's signature. */
+  signedHeaders?: string;
 }): Buffer {
+  const domain = opts.from.split("@")[1];
   const lines = [
     `Authentication-Results: ${opts.auth}`,
+    ...(opts.prepend ?? []),
+    `DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed; d=${domain}; s=s1;\r\n h=${opts.signedHeaders ?? "from:to:subject:date"}; bh=ZmFrZQ==;\r\n b=abcdefgh0123456789`,
     `From: Szolgáltató <${opts.from}>`,
     `To: ${opts.to ?? "Me <me@example.com>"}`,
     "Subject: =?UTF-8?Q?Sz=C3=A1mla?=",
@@ -45,7 +52,8 @@ function message(opts: {
   return Buffer.from(lines.join("\r\n"));
 }
 
-const GOOD_AUTH = "mx.google.com; dkim=pass header.i=@mvm.hu; dmarc=pass header.from=mvm.hu";
+const GOOD_AUTH =
+  "mx.google.com; dkim=pass header.i=@mvm.hu header.s=s1 header.b=abcdefgh; dmarc=pass header.from=mvm.hu";
 
 function mailSettings(overrides: Partial<MailSettings> = {}): MailSettings {
   return {
@@ -125,7 +133,7 @@ test("a mail without a PDF queues its body text", async () => {
   const clock = fixedClock("2026-09-20T10:00:00Z");
   const msg = message({
     from: "ertesito@telekom.hu",
-    auth: "mx.google.com; dmarc=pass header.from=telekom.hu",
+    auth: "mx.google.com; dkim=pass header.i=@telekom.hu header.s=s1 header.b=abcdefgh; dmarc=pass header.from=telekom.hu",
     body: "Fizetendő: 8 990 Ft, határidő 2026.10.15",
   });
   await ingestMail(
@@ -229,4 +237,68 @@ test("queue items and the mail cursor are saved together or not at all", async (
   await sql`DROP TRIGGER crash`.execute(db);
   assert.deepEqual(await ingestMail(deps, settings), { queued: 1, skipped: 0 });
   assert.deepEqual(mailbox.cursors, [null, null]);
+});
+
+async function ingestOne(source: Buffer): Promise<{ queued: number; skipped: number }> {
+  return ingestMail(
+    {
+      db: memDb(),
+      clock: fixedClock("2026-09-20T10:00:00Z"),
+      log: silentLog,
+      mailbox: fakeMailbox([
+        { mailbox: "INBOX", uidValidity: "1", messages: [{ uid: 1, source }] },
+      ]),
+    },
+    mailSettings(),
+  );
+}
+
+const SUPPLIER = "billing@mvm.hu";
+
+test("a genuine bill re-sent with an extra To above the signed one is refused", async () => {
+  // DKIM verifies only the bottom-most To, so the prepended one is unsigned yet still passes.
+  const resent = message({
+    from: SUPPLIER,
+    auth: GOOD_AUTH,
+    pdf: PDF,
+    to: "stranger@example.com",
+    prepend: ["To: me@example.com"],
+  });
+  assert.deepEqual(await ingestOne(resent), { queued: 0, skipped: 1 });
+});
+
+test("a genuine bill re-sent with us only in Cc is refused", async () => {
+  const resent = message({
+    from: SUPPLIER,
+    auth: GOOD_AUTH,
+    pdf: PDF,
+    to: "stranger@example.com",
+    prepend: ["Cc: me@example.com"],
+  });
+  assert.deepEqual(await ingestOne(resent), { queued: 0, skipped: 1 });
+});
+
+test("a bill with a repeated Cc header is refused even when To is ours", async () => {
+  const resent = message({
+    from: SUPPLIER,
+    auth: GOOD_AUTH,
+    pdf: PDF,
+    prepend: ["Cc: a@example.com", "Cc: b@example.com"],
+  });
+  assert.deepEqual(await ingestOne(resent), { queued: 0, skipped: 1 });
+});
+
+test("a bill addressed to us in a To the signature does not cover is refused", async () => {
+  const unsigned = message({
+    from: SUPPLIER,
+    auth: GOOD_AUTH,
+    pdf: PDF,
+    signedHeaders: "from:subject:date",
+  });
+  assert.deepEqual(await ingestOne(unsigned), { queued: 0, skipped: 1 });
+});
+
+test("a bill with one signed To that is ours is queued", async () => {
+  const bill = message({ from: SUPPLIER, auth: GOOD_AUTH, pdf: PDF });
+  assert.deepEqual(await ingestOne(bill), { queued: 1, skipped: 0 });
 });
