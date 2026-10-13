@@ -29,7 +29,7 @@ export const transactionsResponse = z.object({
  * Provider transaction → our row. The bank's own reference is the key when it gives one;
  * otherwise a content hash plus the occurrence index, so two identical same-day card
  * payments stay two rows.
- * nova: the index assumes the bank lists identical entries in a stable order across fetches;
+ * The index assumes the bank lists identical entries in a stable order across fetches;
  * revisit if a hashed-key account ever shows duplicates or gaps.
  */
 export function toTransactions(items: ProviderTransaction[]): NewTransaction[] {

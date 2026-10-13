@@ -1,7 +1,7 @@
 # Assumptions, thresholds and guide deviations
 
-The house guides are `ARCHITECTURE_GUIDE_v2.md` (A§) and `CODING_GUIDE_v2.md` (C§), in the
-Falcon repo under `_guides/anonim/`. This app follows them; where it does less, the deviation,
+The house guides are an architecture guide (A§) and a coding guide (C§), kept outside this
+repository. This app follows them; where it does less, the deviation,
 its reason and the trigger that ends it are recorded here.
 
 ## What the app is

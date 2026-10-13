@@ -126,7 +126,7 @@ export class Poller {
   }
 }
 
-// nova: the scheduler lives in the web process (a deviation recorded in docs/assumptions.md);
+// The scheduler lives in the web process (a deviation recorded in docs/assumptions.md);
 // move it to a worker process when a second process exists.
 /** Triggers a pass every `everyMinutes` minutes; returns the timer that stops it. */
 export function schedulePolling(

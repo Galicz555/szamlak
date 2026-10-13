@@ -74,7 +74,7 @@ export async function completeBankSession(
     aspspCountry: aspsp.country,
     validUntil: session.validUntil,
     accounts: session.accounts.map((a) => ({
-      // nova: IBAN is the identity that survives a consent renewal; a bank that sends none
+      // IBAN is the identity that survives a consent renewal; a bank that sends none
       // starts a fresh account row on renewal. Fine for Erste/Revolut, which send IBANs.
       accountKey: a.iban ? `iban:${a.iban.replace(/\s+/g, "").toUpperCase()}` : `uid:${a.uid}`,
       providerUid: a.uid,

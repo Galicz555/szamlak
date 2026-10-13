@@ -28,7 +28,7 @@ export function isBankLoginUrl(url: string): boolean {
 // Assumed when a bank does not state its maximum consent validity.
 const DEFAULT_CONSENT_SECONDS = 90 * 86_400;
 const REQUEST_TIMEOUT_MS = 30_000;
-// nova: page cap guards against a provider that never stops paginating; 50 pages is years of
+// Page cap guards against a provider that never stops paginating; 50 pages is years of
 // household traffic.
 const MAX_TRANSACTION_PAGES = 50;
 
