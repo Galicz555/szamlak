@@ -14,6 +14,7 @@ import { fixedClock, inboundItem, memDb, scripted, silentLog, tempDir } from "./
 
 const TEXT = `Magyar Telekom Nyrt.
 Számlaszám: 123-456-789
+Ügyfélazonosító: 987654321
 Fizetési határidő: 2026.10.15
 Fizetendő összeg: 8 990 Ft`;
 
@@ -172,4 +173,54 @@ test("a failure after the bill is written but before the item is marked leaves n
     .select(["status", "result_code"])
     .executeTakeFirst();
   assert.deepEqual({ ...row }, { status: "processed", result_code: "bill_created" });
+});
+
+// The item's sender domain is telekom.hu (test helper default).
+const OWN = [{ domain: "telekom.hu", payerId: "987654321" }];
+
+async function runWithPayerIds(
+  payerIds: { domain: string; payerId: string }[] | undefined,
+  answer: Extraction,
+): Promise<{ db: Kysely<Database> }> {
+  const db = memDb();
+  const clock = fixedClock("2026-09-20T10:00:00Z");
+  const dataDir = await queueOne(db, clock);
+  const extractor = fakeExtractor([() => answer]);
+  await processQueue(
+    { db, clock, log: silentLog, extractor },
+    { dataDir, maxAttempts: 3, payerIds },
+  );
+  return { db };
+}
+
+test("with own payer ids set, a bill carrying one of them becomes a bill", async () => {
+  const { db } = await runWithPayerIds(OWN, { ...good, payer_id: "987654321" });
+  assert.equal((await listActiveBills(db)).length, 1);
+});
+
+test("with own payer ids set, a bill of another payer goes to manual review", async () => {
+  const { db } = await runWithPayerIds(OWN, { ...good, payer_id: "123-456-789" });
+  assert.equal((await listActiveBills(db)).length, 0);
+  const [item] = await listDeadLetteredInboundItems(db);
+  assert.equal(item?.last_error_code, "PAYER_ID_NOT_ALLOWED");
+});
+
+test("with own payer ids set, a bill with no verified payer id goes to manual review", async () => {
+  const { db } = await runWithPayerIds(OWN, good);
+  assert.equal((await listActiveBills(db)).length, 0);
+  assert.equal((await listDeadLetteredInboundItems(db)).length, 1);
+});
+
+test("an own payer id listed for another supplier does not admit this supplier's bill", async () => {
+  const { db } = await runWithPayerIds([{ domain: "mvm.hu", payerId: "987654321" }], {
+    ...good,
+    payer_id: "987654321",
+  });
+  assert.equal((await listActiveBills(db)).length, 0);
+  assert.equal((await listDeadLetteredInboundItems(db)).length, 1);
+});
+
+test("without own payer ids set, any verified payer id becomes a bill, as before", async () => {
+  const { db } = await runWithPayerIds(undefined, { ...good, payer_id: "123-456-789" });
+  assert.equal((await listActiveBills(db)).length, 1);
 });

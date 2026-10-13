@@ -22,7 +22,11 @@ export function pollerSettingsFrom(env: Env): PollerSettings {
       trustedAuthserv: env.MAIL_TRUSTED_AUTHSERV,
       recipients: env.MAIL_RECIPIENTS,
     },
-    extract: { dataDir: env.DATA_DIR, maxAttempts: env.EXTRACT_MAX_ATTEMPTS },
+    extract: {
+      dataDir: env.DATA_DIR,
+      maxAttempts: env.EXTRACT_MAX_ATTEMPTS,
+      payerIds: env.MAIL_PAYER_IDS,
+    },
     bank: {
       timeZone: env.TIME_ZONE,
       lookbackDays: env.BANK_LOOKBACK_DAYS,

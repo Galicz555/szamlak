@@ -24,9 +24,36 @@ export interface ExtractDeps {
   extractor: BillExtractor;
 }
 
+/** One of the owner's own payer ids, for the supplier domain (or a parent of the sender's). */
+export interface PayerIdEntry {
+  domain: string;
+  payerId: string;
+}
+
 export interface ExtractSettings {
   dataDir: string;
   maxAttempts: number;
+  /**
+   * When set, a bill becomes a bill only if its verified payer id is listed for its sender; any
+   * other goes to manual review. A genuine bill another customer re-sent to us carries their id.
+   */
+  payerIds?: readonly PayerIdEntry[] | undefined;
+}
+
+function isOwnPayerId(
+  own: readonly PayerIdEntry[],
+  senderDomain: string,
+  payerId: string | null,
+): boolean {
+  const domain = senderDomain.toLowerCase();
+  return (
+    payerId !== null &&
+    own.some(
+      (e) =>
+        e.payerId === payerId.toLowerCase() &&
+        (domain === e.domain || domain.endsWith(`.${e.domain}`)),
+    )
+  );
 }
 
 /**
@@ -60,7 +87,7 @@ async function processItem(
   item: InboundItem,
 ): Promise<void> {
   const text = await fetchItemText(settings.dataDir, item);
-  await saveOutcome(deps, item, await extractVerified(deps.extractor, text));
+  await saveOutcome(deps, item, await extractVerified(deps.extractor, text), settings.payerIds);
 }
 
 function fetchItemText(dataDir: string, item: InboundItem): Promise<string> {
@@ -73,6 +100,7 @@ async function saveOutcome(
   { db, clock, extractor }: ExtractDeps,
   item: InboundItem,
   { verdict, extraction }: ExtractionOutcome,
+  payerIds: ExtractSettings["payerIds"],
 ): Promise<void> {
   switch (verdict.kind) {
     case "not_a_bill":
@@ -82,6 +110,13 @@ async function saveOutcome(
     case "rejected":
       throw new AppError("invalid", "EXTRACTION_UNVERIFIED", verdict.problems.join("; "));
     case "bill": {
+      if (payerIds && !isOwnPayerId(payerIds, item.sender_domain, verdict.bill.payerId)) {
+        throw new AppError(
+          "invalid",
+          "PAYER_ID_NOT_ALLOWED",
+          `payer id ${verdict.bill.payerId ?? "(none)"} is not listed for ${item.sender_domain} in MAIL_PAYER_IDS`,
+        );
+      }
       const bill: NewBill = {
         inboundItemId: item.id,
         senderDomain: item.sender_domain,

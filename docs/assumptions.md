@@ -74,6 +74,11 @@ it never sends mail, never moves money, never changes the mailbox.
   shared invoicing platform (szamlazz.hu, billingo.hu): every customer of such a platform holds
   a valid signature for its domain.
 
+- **Your own payer id is an optional second gate.** With `MAIL_PAYER_IDS` set, a bill is created
+  only if its verified payer id is listed for its sender domain (or a parent of it); every other
+  one, including a bill with no payer id and one from an unlisted supplier, lands in the
+  manual-review inbox as `PAYER_ID_NOT_ALLOWED`. Unset, nothing changes. It holds even if the
+  recipient check above were bypassed, because a re-sent bill carries the other customer's id.
 - **The Authentication-Results header is parsed, not grepped.** Comments and quoted strings are
   removed before the `;` split, because Gmail repeats the sender-controlled envelope address in
   there. Open question: mail pulled in by Gmail's "Check mail from other accounts" (POP import)

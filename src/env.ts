@@ -12,6 +12,14 @@ const csv = z
   )
   .pipe(z.array(z.string()).min(1));
 
+const payerIdEntry = z
+  .string()
+  .regex(/^[a-z0-9.-]+=[^\s=]+$/, "expected supplier-domain=payer-id")
+  .transform((entry) => {
+    const [domain = "", payerId = ""] = entry.split("=");
+    return { domain, payerId };
+  });
+
 const DEFAULT_GEMINI_MODEL = "gemini-2.5-flash";
 
 // A blank `.env` line (`GEMINI_API_KEY=`) means "not configured" for an optional setting.
@@ -51,6 +59,10 @@ const envSchema = z
     // Addresses bills are sent to; defaults to IMAP_USER. A bill addressed to someone else
     // (a genuine one re-sent by another customer) is ignored.
     MAIL_RECIPIENTS: z.preprocess(unsetIfEmpty, csv.optional()),
+    // Optional. Your own payer id per supplier, `mvm.hu=123456789,telekom.hu=987654321` (repeat
+    // a supplier for several ids). When set, a bill whose payer id is not listed for its sender
+    // goes to manual review instead of becoming a bill.
+    MAIL_PAYER_IDS: z.preprocess(unsetIfEmpty, csv.pipe(z.array(payerIdEntry)).optional()),
     MAIL_LOOKBACK_DAYS: z.coerce.number().int().min(1).max(730).default(180),
 
     EXTRACTOR: z.enum(["local", "gemini"]),
