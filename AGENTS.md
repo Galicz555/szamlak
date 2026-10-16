@@ -15,7 +15,7 @@ pnpm eval:extract samples/   # local vs Gemini extraction quality gate
 pnpm backup:verify    # restore drill on the newest snapshot
 ```
 
-Code style: `docs/code-style.md`.
+Code style: `docs/code-style.md`, a private guide kept outside the public repository (gitignored).
 
 Node 26 runs the `.ts` files directly (type stripping): only erasable syntax — no `enum`,
 no `namespace`, no parameter properties. Relative imports carry the `.ts` extension.
@@ -35,7 +35,7 @@ no `namespace`, no parameter properties. Relative imports carry the `.ts` extens
 | `src/bills/`   | Bill repo, the inbound-item queue repo, and the derived state                                                                                                                                                     |
 | `src/poll/`    | `Poller` (the background work card is in its header), its settings from the environment, run records, backup                                                                                                      |
 | `src/web/`     | Hono on `@hono/node-server`: middleware (Host/Origin guard, security headers), `src/web/routes/` and `src/web/pages/` per domain, auto-escaping `html` template                                                   |
-| `docs/`        | `assumptions.md` (deviations, thresholds, trust boundaries, secrets), `glossary.md`, `code-style.md`                                                                                                              |
+| `docs/`        | `assumptions.md` (deviations, thresholds, trust boundaries, secrets), `glossary.md`                                                                                                              |
 
 ## Rules that are easy to break
 

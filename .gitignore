@@ -12,3 +12,6 @@ secrets/
 *.key
 *.log
 samples/
+
+# Private style guide, kept local
+docs/code-style.md
